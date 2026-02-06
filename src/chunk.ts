@@ -44,23 +44,28 @@ export async function getChunkBlob(env: Env, chunk: Chunk): Promise<Blob | null>
  */
 export function limit(streamInput: ReadableStream, limitBytes: number): ReadableStream {
   if (streamInput instanceof FixedLengthStream) return streamInput;
+
+  // R2 only accepts streams of a known length, so this has to stay a FixedLengthStream.
   const stream = new FixedLengthStream(limitBytes, {});
 
   (async () => {
-    const w = stream.writable.getWriter();
-    const r = streamInput.getReader();
+    const reader = streamInput.getReader();
+    const writer = stream.writable.getWriter();
     let written = 0;
-    while (true) {
-      const { done, value } = await r.read();
-      if (done) break;
-      await w.write(value);
-      written += value.length;
-      if (written >= limitBytes) break;
+    try {
+      while (written < limitBytes) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const toWrite = value.length + written > limitBytes ? value.slice(0, limitBytes - written) : value;
+        await writer.write(toWrite);
+        written += toWrite.length;
+      }
+      reader.releaseLock();
+      await writer.close();
+    } catch (e) {
+      // Propagate the error to the consumer instead of leaving it waiting for bytes that never come
+      await writer.abort(e).catch(() => undefined);
     }
-
-    r.releaseLock();
-    w.releaseLock();
-    await stream.writable.close();
   })();
 
   return stream.readable;

@@ -1,7 +1,7 @@
 import { Router } from "itty-router";
 import { BlobUnknownError, ManifestUnknownError } from "./v2-errors";
 import { ImmutableBlobError, ImmutableTagError, InternalError, ServerError } from "./errors";
-import { errorString, jsonHeaders, wrap } from "./utils";
+import { errorString, getStreamSize, jsonHeaders, wrap } from "./utils";
 import { hexToDigest, isValidDigest } from "./user";
 import { ManifestTagsListTooBigError } from "./v2-responses";
 import { Env } from "..";
@@ -584,17 +584,19 @@ v2Router.get("/:name+/blobs/uploads/:uuid", async (req, env: Env) => {
 v2Router.patch("/:name+/blobs/uploads/:uuid", async (req, env: Env) => {
   const { name, uuid } = req.params;
   const contentRange = req.headers.get("Content-Range");
-  const [start, end] = contentRange?.split("-") ?? [undefined, undefined];
+  const rangeMatch = contentRange?.match(/(?:bytes\s+)?(\d+)-(\d+)/);
+  const [start, end] = rangeMatch ? [rangeMatch[1], rangeMatch[2]] : [undefined, undefined];
 
   if (req.body == null) {
     return new Response(null, { status: 400 });
   }
 
-  let contentLengthString = req.headers.get("Content-Length");
+  let streamSize = getStreamSize(req.headers);
   let stream = req.body;
-  if (!contentLengthString) {
+  if (streamSize === undefined) {
+    // Without Content-Length or Content-Range the length is only known once the body has been read
     const blob = await req.blob();
-    contentLengthString = `${blob.size}`;
+    streamSize = blob.size;
     stream = blob.stream();
   }
 
@@ -605,7 +607,7 @@ v2Router.patch("/:name+/blobs/uploads/:uuid", async (req, env: Env) => {
       uuid,
       url.pathname + "?" + url.searchParams.toString(),
       stream,
-      +contentLengthString,
+      streamSize,
       end !== undefined && start !== undefined ? [+start, +end] : undefined,
     ),
   );
@@ -623,8 +625,7 @@ v2Router.patch("/:name+/blobs/uploads/:uuid", async (req, env: Env) => {
     status: 202,
     headers: {
       "Location": res.location,
-      // Note that the HTTP Range header byte ranges are inclusive and that will be honored, even in non-standard use cases.
-      "Range": `${res.range.join("-")}`,
+      "Range": `0-${res.range[1]}`, // Ensure correct Range format (0-N)
       "Docker-Upload-UUID": res.id,
     },
   });
