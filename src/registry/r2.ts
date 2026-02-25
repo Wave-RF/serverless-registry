@@ -1068,13 +1068,15 @@ export class R2Registry implements Registry {
         if (env.PUSH_COMPATIBILITY_MODE === "full") {
           const [stream1, stream2] = limit(stream, size).tee();
           const partTask = upload.uploadPart(state.parts.length + 1, stream1);
-
+          // We can totally disable this, however we are risking that the client sends another small chunk.
+          // Maybe instead we can throw range error
           const dateInOneHour = new Date();
           dateInOneHour.setTime(dateInOneHour.getTime() + 60 * 60 * 1000);
           const headers = {
+            // https://www.rfc-editor.org/rfc/rfc1123 date format
+            // Objects will typically be removed from a bucket within 24 hours of the x-amz-expiration value.
             "x-amz-expiration": dateInOneHour.toUTCString(),
           } as const;
-
           const r2RegistryObjectTask = env.REGISTRY.put(path, stream2, {
             httpMetadata: new Headers(headers),
             customMetadata: headers,
