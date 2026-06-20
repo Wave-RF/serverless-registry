@@ -628,7 +628,7 @@ describe("v2 manifests", () => {
 
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({
-      errors: [expect.objectContaining({ code: "MANIFEST_INVALID" })],
+      errors: [expect.objectContaining({ code: "DIGEST_INVALID" })],
     });
     expect(await bindings.REGISTRY.head(`${name}/manifests/${requestedDigest}`)).toBeNull();
     expect(await bindings.REGISTRY.head(`${name}/manifests/${computedDigest}`)).toBeNull();
@@ -3077,5 +3077,57 @@ describe("blob and manifest GET/HEAD response headers", () => {
     expect(head.headers.get("Content-Length")).toEqual(`${size}`);
     expect(head.headers.get("Content-Type")).toEqual("application/gzip");
     expect(head.headers.get("Content-Encoding")).toEqual("identity");
+  });
+});
+
+describe("manifest PUT digest validation", () => {
+  test("PUT manifest by a mismatched digest is rejected 400 DIGEST_INVALID (not stored)", async () => {
+    const name = "manifestdigest/mismatch";
+    const manifest = await generateManifest(name);
+    const data = JSON.stringify(manifest);
+    const wrongDigest = "sha256:" + "0".repeat(64);
+    const res = await fetch(
+      createRequest("PUT", `/v2/${name}/manifests/${wrongDigest}`, new Blob([data]).stream(), {
+        "Content-Type": "application/vnd.oci.image.manifest.v1+json",
+      }),
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { errors: { code: string }[] };
+    expect(body.errors[0].code).toBe("DIGEST_INVALID");
+    // Must NOT have been stored under the wrong digest key.
+    const get = await fetch(createRequest("GET", `/v2/${name}/manifests/${wrongDigest}`, null));
+    expect(get.status).toBe(404);
+  });
+
+  test("PUT manifest by a malformed digest reference is rejected 400 DIGEST_INVALID", async () => {
+    const name = "manifestdigest/malformed";
+    const manifest = await generateManifest(name);
+    const res = await fetch(
+      createRequest(
+        "PUT",
+        `/v2/${name}/manifests/sha256:baddigeststring`,
+        new Blob([JSON.stringify(manifest)]).stream(),
+        {
+          "Content-Type": "application/vnd.oci.image.manifest.v1+json",
+        },
+      ),
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { errors: { code: string }[] };
+    expect(body.errors[0].code).toBe("DIGEST_INVALID");
+  });
+
+  test("PUT manifest by its correct digest still succeeds (201)", async () => {
+    const name = "manifestdigest/correct";
+    const manifest = await generateManifest(name);
+    const data = JSON.stringify(manifest);
+    const digest = await getSHA256(data);
+    const res = await fetch(
+      createRequest("PUT", `/v2/${name}/manifests/${digest}`, new Blob([data]).stream(), {
+        "Content-Type": "application/vnd.oci.image.manifest.v1+json",
+      }),
+    );
+    expect(res.status).toBe(201);
+    expect(res.headers.get("docker-content-digest")).toEqual(digest);
   });
 });
