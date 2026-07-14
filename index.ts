@@ -24,6 +24,8 @@ export interface Env {
   READONLY_PASSWORD?: string;
   PUSH_COMPATIBILITY_MODE?: PushCompatibilityMode;
   REGISTRIES_JSON?: string; // should be in the format of RegistryConfiguration[];
+  // Tags matching this regular expression (the whole tag) are create-only, see src/registry/tag-policy.ts
+  IMMUTABLE_TAG_PATTERN?: string;
   // Repositories that can be pulled without credentials, see src/anonymous.ts
   ANONYMOUS_PULL_REPOSITORIES?: string;
   // Per request, set by fetch() below
