@@ -31,10 +31,10 @@ import {
   BlobRangeRequest,
 } from "./registry";
 import { GarbageCollectionMode, GarbageCollector } from "./garbage-collector";
-import { ManifestSchema, manifestSchema } from "../manifest";
+import { ManifestSchema, manifestSchema, withInferredMediaType } from "../manifest";
 import { isImmutableTagReference, resolveImmutableTagPattern } from "./tag-policy";
 
-export const ociImageIndexContentType = "application/vnd.oci.image.index.v1+json";
+export { ociImageIndexContentType } from "../manifest";
 
 function rangeNotSatisfiableResponse(size: number): Response {
   return new Response(null, {
@@ -539,7 +539,7 @@ export class R2Registry implements Registry {
       };
     }
 
-    const manifestResult = manifestSchema.safeParse(manifestJSON);
+    const manifestResult = manifestSchema.safeParse(withInferredMediaType(manifestJSON, contentType));
     if (!manifestResult.success) {
       const firstIssue = manifestResult.error.issues[0];
       const path = firstIssue?.path.length ? `${firstIssue.path.join(".")}: ` : "";
