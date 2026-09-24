@@ -8,6 +8,7 @@ import v2Router from "./src/router";
 import { authenticationMethodFromEnv } from "./src/authentication-method";
 import { Registry } from "./src/registry/registry";
 import { R2Registry } from "./src/registry/r2";
+import { anonymousPullRepository } from "./src/anonymous";
 
 // A full compatibility mode means that the r2 registry will try its best to
 // help the client on the layer push. See how we let the client push layers with chunked uploads for more information.
@@ -23,7 +24,11 @@ export interface Env {
   READONLY_PASSWORD?: string;
   PUSH_COMPATIBILITY_MODE?: PushCompatibilityMode;
   REGISTRIES_JSON?: string; // should be in the format of RegistryConfiguration[];
+  // Repositories that can be pulled without credentials, see src/anonymous.ts
+  ANONYMOUS_PULL_REPOSITORIES?: string;
+  // Per request, set by fetch() below
   REGISTRY_CLIENT: Registry;
+  ANONYMOUS_REQUEST?: boolean;
 }
 
 const router = Router();
@@ -46,16 +51,26 @@ export default {
       return new AuthErrorResponse(request);
     }
 
+    let anonymous = false;
     const credentials = await authMethod.checkCredentials(request);
     if (!credentials.verified) {
-      console.warn(`Not Authorized. authmode=${authMethod.authmode}. verified=false`);
-      return new AuthErrorResponse(request);
+      // Requests without any credentials may pull repositories listed in ANONYMOUS_PULL_REPOSITORIES.
+      // Wrong or expired credentials are still rejected, so clients notice them. /v2/ keeps answering
+      // 401 with a Basic challenge, which is what makes docker send credentials for pushes.
+      anonymous = request.headers.get("Authorization") === null && anonymousPullRepository(env, request) !== null;
+      if (!anonymous) {
+        console.warn(`Not Authorized. authmode=${authMethod.authmode}. verified=false`);
+        return new AuthErrorResponse(request);
+      }
     }
 
-    env.REGISTRY_CLIENT = new R2Registry(env);
+    // env is shared by all concurrent requests of this isolate, so everything that depends on the
+    // request goes into a copy.
+    const requestEnv: Env = { ...env, ANONYMOUS_REQUEST: anonymous };
+    requestEnv.REGISTRY_CLIENT = new R2Registry(requestEnv);
     try {
       // Dispatch the request to the appropriate route
-      const res = await router.fetch(request, env, context);
+      const res = await router.fetch(request, requestEnv, context);
       return res;
     } catch (err) {
       if (err instanceof Response) {
