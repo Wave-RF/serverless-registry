@@ -72,11 +72,11 @@ jobs:
           if-no-files-found: ignore
 
   conformance-main:
-    # The suite on distribution-spec's main branch is still changing, so this job only reports.
+    # The suite on distribution-spec's main branch is still changing, so this job only reports: a
+    # failing suite is shown in the job summary but does not fail the job.
     name: OCI conformance (main, non-blocking)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -107,6 +107,9 @@ jobs:
       - name: Start the registry
         run: ./.github/scripts/start-registry.sh 5000 "$RUNNER_TEMP/registry"
       - name: Run the conformance suite
+        id: suite
+        continue-on-error: true
+        shell: bash
         env:
           OCI_VERSION: "1.1"
           OCI_REGISTRY: 127.0.0.1:5000
@@ -121,7 +124,18 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/results"
           cd "$RUNNER_TEMP/results"
-          OCI_RESULTS_DIR="$RUNNER_TEMP/results" "$RUNNER_TEMP/conformance"
+          OCI_RESULTS_DIR="$RUNNER_TEMP/results" "$RUNNER_TEMP/conformance" | tee "$RUNNER_TEMP/results/output.txt"
+      - name: Summarize
+        if: always()
+        env:
+          OUTCOME: ${{ steps.suite.outcome }}
+        run: |
+          {
+            echo "### OCI conformance, distribution-spec main: $OUTCOME"
+            echo '```'
+            sed -n '/OCI Conformance Result/,$p' "$RUNNER_TEMP/results/output.txt" 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload the report
         if: always()
         uses: actions/upload-artifact@v6
