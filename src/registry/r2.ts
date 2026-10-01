@@ -46,6 +46,41 @@ function rangeNotSatisfiableResponse(size: number): Response {
   });
 }
 
+/**
+ * Writes a content-addressed object only if it does not exist yet, and treats an existing object as
+ * success. These keys (a blob or manifest stored under its digest, a mounted blob, a referrer entry)
+ * always describe the same content, so an existing object means the write already happened. Never
+ * overwriting them keeps pushes working on buckets whose content prefixes refuse overwrites, such as
+ * R2 buckets with bucket locks or other retention rules, and avoids rewriting large blobs on re-push.
+ *
+ * Returns the stored object, or the object that was already there.
+ */
+export async function putIfAbsent(
+  bucket: R2Bucket,
+  key: string,
+  value: ReadableStream | ArrayBuffer | ArrayBufferView | string | null | Blob,
+  options: R2PutOptions = {},
+): Promise<R2Object> {
+  let created: R2Object | null;
+  try {
+    created = await bucket.put(key, value, { ...options, onlyIf: { etagDoesNotMatch: "*" } });
+  } catch (err) {
+    // A retention rule can refuse the write outright instead of failing the precondition. That is
+    // still success when the object is already there.
+    const existing = await bucket.head(key);
+    if (existing !== null) return existing;
+    throw err;
+  }
+
+  if (created !== null) return created;
+  const existing = await bucket.head(key);
+  if (existing === null) {
+    throw new Error(`conditional write of ${key} was refused, but the object does not exist`);
+  }
+
+  return existing;
+}
+
 function referrersPrefix(name: string, digest: string): string {
   return `${name}/_referrers/${digest}/`;
 }
@@ -586,13 +621,18 @@ export class R2Registry implements Registry {
       if (referrerDescriptor === null || subjectDigest === undefined) {
         return null;
       }
-      return env.REGISTRY.put(referrersPath(name, subjectDigest, digestStr), JSON.stringify(referrerDescriptor), {
-        httpMetadata: {
-          contentType: "application/json",
+      return putIfAbsent(
+        env.REGISTRY,
+        referrersPath(name, subjectDigest, digestStr),
+        JSON.stringify(referrerDescriptor),
+        {
+          httpMetadata: {
+            contentType: "application/json",
+          },
         },
-      });
+      );
     };
-    const digestPut = () => env.REGISTRY.put(`${name}/manifests/${digestStr}`, text, putOptions);
+    const digestPut = () => putIfAbsent(env.REGISTRY, `${name}/manifests/${digestStr}`, text, putOptions);
     const immutableReference = reference !== digestStr && isImmutableTagReference(reference, immutablePattern);
 
     if (immutableReference) {
@@ -683,7 +723,7 @@ export class R2Registry implements Registry {
         return { response: new ServerError("invalid checksum from R2 backend") };
       }
       const [newFile, error] = await wrap(
-        this.env.REGISTRY.put(destinationLayerPath, sourceLayerPath, {
+        putIfAbsent(this.env.REGISTRY, destinationLayerPath, sourceLayerPath, {
           // Symlink object content is the source blob path string.
           // The object checksum must match the symlink payload to satisfy R2.
           sha256: await getSHA256(sourceLayerPath, ""),
@@ -1167,7 +1207,7 @@ export class R2Registry implements Registry {
     // it bubble up as an opaque 500. Any other failure is a genuine server error.
     const putBlob = async (body: ReadableStream | Uint8Array | null): Promise<RegistryError | null> => {
       const [, err] = await wrap(
-        this.env.REGISTRY.put(`${namespace}/blobs/${expectedSha}`, body, {
+        putIfAbsent(this.env.REGISTRY, `${namespace}/blobs/${expectedSha}`, body, {
           sha256: (expectedSha as string).slice(SHA256_PREFIX_LEN),
         }),
       );
@@ -1254,7 +1294,7 @@ export class R2Registry implements Registry {
       return false;
     }
 
-    await this.env.REGISTRY.put(`${namespace}/blobs/${sha256}`, stream, {
+    await putIfAbsent(this.env.REGISTRY, `${namespace}/blobs/${sha256}`, stream, {
       sha256: (sha256 as string).slice(SHA256_PREFIX_LEN),
     });
     return {

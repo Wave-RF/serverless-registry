@@ -3581,3 +3581,123 @@ describe("mounted blob HEAD reports source metadata", () => {
     expect(head.headers.get("Docker-Content-Digest")).toEqual(digest);
   });
 });
+
+describe("content-addressed writes", () => {
+  // Simulates a bucket with retention rules on its content prefixes (blobs, manifests by digest and
+  // referrer entries): such objects can be created, but never overwritten or deleted.
+  function retainedBucket(bucket: R2Bucket): R2Bucket {
+    const retained = (key: string) => /\/(blobs\/|manifests\/sha256:|_referrers\/)/.test(key);
+    return new Proxy(bucket, {
+      get(target, prop) {
+        if (prop === "put") {
+          return async (key: string, value: ReadableStream | string | null, options?: R2PutOptions) => {
+            if (retained(key) && (await target.head(key)) !== null) {
+              throw new Error(`put: object ${key} is retained and cannot be overwritten`);
+            }
+            return target.put(key, value, options);
+          };
+        }
+        if (prop === "delete") {
+          return async (keys: string | string[]) => {
+            for (const key of Array.isArray(keys) ? keys : [keys]) {
+              if (retained(key)) throw new Error(`delete: object ${key} is retained`);
+            }
+            return target.delete(keys);
+          };
+        }
+        const value = Reflect.get(target, prop);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  }
+
+  async function fetchRetained(r: Request): Promise<Response> {
+    r.headers.append("Authorization", usernamePasswordToAuth(username, "world"));
+    const bindings = env as Env;
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(r, { ...bindings, REGISTRY: retainedBucket(bindings.REGISTRY) } as Env, ctx);
+    await waitOnExecutionContext(ctx);
+    return res as Response;
+  }
+
+  async function pushBlob(f: (r: Request) => Promise<Response>, name: string, data: string, digest: string) {
+    const post = await f(createRequest("POST", `/v2/${name}/blobs/uploads/`, null, {}));
+    expect(post.status).toEqual(202);
+    const put = await f(
+      createRequest("PUT", `${post.headers.get("location")!}&digest=${digest}`, new Blob([data]).stream(), {
+        "Content-Length": `${data.length}`,
+      }),
+    );
+    expect(put.status).toEqual(201);
+  }
+
+  test("re-pushing existing content does not rewrite it", async () => {
+    const name = "content-addressed/repush";
+    const bindings = env as Env;
+    const manifest = await generateManifest(name);
+    const { sha256 } = await createManifest(name, manifest, "v1");
+    const layer = getLayersFromManifest(manifest)[1];
+    const manifestBefore = (await bindings.REGISTRY.head(`${name}/manifests/${sha256}`))!;
+    const layerBefore = (await bindings.REGISTRY.head(`${name}/blobs/${layer}`))!;
+
+    const layerData = await (await bindings.REGISTRY.get(`${name}/blobs/${layer}`))!.text();
+    await pushBlob(fetch, name, layerData, layer);
+    await createManifest(name, manifest, "v2");
+
+    expect((await bindings.REGISTRY.head(`${name}/manifests/${sha256}`))!.version).toEqual(manifestBefore.version);
+    expect((await bindings.REGISTRY.head(`${name}/blobs/${layer}`))!.version).toEqual(layerBefore.version);
+    const tags = (await (await fetch(createRequest("GET", `/v2/${name}/tags/list`, null))).json()) as TagsList;
+    expect(tags.tags).toEqual(["v1", "v2"]);
+  });
+
+  test("pushes of existing content succeed when the content keys cannot be overwritten", async () => {
+    const name = "content-addressed/retained";
+    const mounted = "content-addressed/retained-mount";
+    const bindings = env as Env;
+    const manifest = await generateManifest(name);
+    const data = JSON.stringify(manifest);
+    const { sha256 } = await createManifest(name, manifest, "v1");
+    const layer = getLayersFromManifest(manifest)[1];
+    const layerData = await (await bindings.REGISTRY.get(`${name}/blobs/${layer}`))!.text();
+    const artifact = {
+      ...getImageManifestV2(await generateManifest(name)),
+      artifactType: "application/vnd.example.signature.v1",
+      subject: { mediaType: "application/vnd.oci.image.manifest.v1+json", digest: sha256, size: data.length },
+    } satisfies ManifestSchema;
+    const artifactData = JSON.stringify(artifact);
+    const artifactDigest = await getSHA256(artifactData);
+    await createManifest(name, artifact);
+    expect(await mountLayersFromManifest(name, manifest, mounted)).toBeGreaterThan(0);
+
+    // Push everything a second time through a bucket that refuses overwrites of content keys
+    await pushBlob(fetchRetained, name, layerData, layer);
+    for (const reference of [sha256, "v1", "v2"]) {
+      const res = await fetchRetained(
+        createRequest("PUT", `/v2/${name}/manifests/${reference}`, new Blob([data]).stream(), {
+          "Content-Type": "application/gzip",
+        }),
+      );
+      expect(res.status).toEqual(201);
+      expect(res.headers.get("docker-content-digest")).toEqual(sha256);
+    }
+    const referrer = await fetchRetained(
+      createRequest("PUT", `/v2/${name}/manifests/${artifactDigest}`, new Blob([artifactData]).stream(), {
+        "Content-Type": "application/gzip",
+      }),
+    );
+    expect(referrer.status).toEqual(201);
+    for (const digest of getLayersFromManifest(manifest)) {
+      const mount = await fetchRetained(
+        createRequest("POST", `/v2/${mounted}/blobs/uploads/?from=${name}&mount=${digest}`, null, {}),
+      );
+      expect(mount.status).toEqual(201);
+    }
+
+    const layerGet = await fetch(createRequest("GET", `/v2/${mounted}/blobs/${layer}`, null));
+    expect(await layerGet.text()).toEqual(layerData);
+    const referrers = await getReferrersIndex(name, sha256);
+    expect(referrers.body.manifests.map((m) => m.digest)).toEqual([artifactDigest]);
+    const tags = (await (await fetch(createRequest("GET", `/v2/${name}/tags/list`, null))).json()) as TagsList;
+    expect(tags.tags).toEqual(["v1", "v2"]);
+  });
+});
