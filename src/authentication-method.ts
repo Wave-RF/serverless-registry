@@ -1,9 +1,9 @@
-import { Env } from "..";
+import type { RegistryEnv } from "..";
 import { newRegistryTokens } from "./token";
 import { UserAuthenticator } from "./user";
 import type { AuthenticatorCredentials } from "./user";
 
-export async function authenticationMethodFromEnv(env: Env) {
+export async function authenticationMethodFromEnv(env: RegistryEnv) {
   if (env.JWT_REGISTRY_TOKENS_PUBLIC_KEY) {
     return await newRegistryTokens(env.JWT_REGISTRY_TOKENS_PUBLIC_KEY);
   } else if ((env.USERNAME && env.PASSWORD) || (env.READONLY_USERNAME && env.READONLY_PASSWORD)) {

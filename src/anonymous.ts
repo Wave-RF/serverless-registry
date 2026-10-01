@@ -1,4 +1,4 @@
-import { Env } from "..";
+import type { RegistryEnv } from "..";
 import { isValidDigest } from "./user";
 
 // Read-only registry endpoints of a repository. Everything else (/v2/, /v2/_catalog, uploads,
@@ -14,7 +14,7 @@ const readPaths: { pattern: RegExp; digest?: boolean }[] = [
 //
 // The variable is a comma or whitespace separated list of repository names, `*` matches any
 // characters including `/`. Examples: `*` (every repository), `some-org/*`, `some-org/app,other/tool`.
-export function anonymousPullPatterns(env: Env): RegExp[] {
+export function anonymousPullPatterns(env: RegistryEnv): RegExp[] {
   return (env.ANONYMOUS_PULL_REPOSITORIES ?? "")
     .split(/[\s,]+/)
     .filter((p) => p.length > 0)
@@ -26,7 +26,7 @@ function escapeRegExp(s: string): string {
 }
 
 // Returns the repository name if the request is a pull that may be served without credentials.
-export function anonymousPullRepository(env: Env, request: Request): string | null {
+export function anonymousPullRepository(env: RegistryEnv, request: Request): string | null {
   if (request.method !== "GET" && request.method !== "HEAD") {
     return null;
   }

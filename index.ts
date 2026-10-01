@@ -1,5 +1,8 @@
 /**
  * The core server that runs on a Cloudflare worker.
+ *
+ * Another Worker can import this module and delegate requests to it, see "Using the registry from
+ * another Worker" in the README.
  */
 
 import { Router } from "itty-router";
@@ -12,11 +15,15 @@ import { anonymousPullRepository } from "./src/anonymous";
 
 // A full compatibility mode means that the r2 registry will try its best to
 // help the client on the layer push. See how we let the client push layers with chunked uploads for more information.
-type PushCompatibilityMode = "full" | "none";
+export type PushCompatibilityMode = "full" | "none";
 
-export interface Env {
+/**
+ * The bindings and variables the registry reads. A Worker that embeds the registry passes an object
+ * of this shape, usually its own env, to `fetch`.
+ */
+export interface RegistryEnv {
   REGISTRY: R2Bucket;
-  ENVIRONMENT: string;
+  ENVIRONMENT?: string;
   JWT_REGISTRY_TOKENS_PUBLIC_KEY?: string;
   USERNAME?: string;
   PASSWORD?: string;
@@ -30,7 +37,10 @@ export interface Env {
   DISABLE_DELETE?: string;
   // Repositories that can be pulled without credentials, see src/anonymous.ts
   ANONYMOUS_PULL_REPOSITORIES?: string;
-  // Per request, set by fetch() below
+}
+
+/** The env seen by the routes: the configuration plus state that fetch() sets for each request. */
+export interface Env extends RegistryEnv {
   REGISTRY_CLIENT: Registry;
   ANONYMOUS_REQUEST?: boolean;
 }
@@ -44,8 +54,8 @@ router.all("/v2/*", v2Router.fetch);
 
 router.all("*", () => new Response("Not Found.", { status: 404 }));
 
-export default {
-  async fetch(request: Request, env: Env, context?: ExecutionContext) {
+const handler = {
+  async fetch(request: Request, env: RegistryEnv, context?: ExecutionContext): Promise<Response> {
     if (!ensureConfig(env)) {
       return new AuthErrorResponse(request);
     }
@@ -70,7 +80,7 @@ export default {
 
     // env is shared by all concurrent requests of this isolate, so everything that depends on the
     // request goes into a copy.
-    const requestEnv: Env = { ...env, ANONYMOUS_REQUEST: anonymous };
+    const requestEnv = { ...env, ANONYMOUS_REQUEST: anonymous } as Env;
     requestEnv.REGISTRY_CLIENT = new R2Registry(requestEnv);
     try {
       // Dispatch the request to the appropriate route
@@ -98,9 +108,12 @@ export default {
       return new InternalError();
     }
   },
-} satisfies ExportedHandler<Env>;
+} satisfies ExportedHandler<RegistryEnv>;
 
-const ensureConfig = (env: Env): boolean => {
+export { handler };
+export default handler;
+
+const ensureConfig = (env: RegistryEnv): boolean => {
   if (!env.REGISTRY) {
     console.error(
       "env.REGISTRY is not setup. Please setup an R2 bucket and add the binding in your wrangler config file. Try 'npx wrangler --env production r2 bucket create r2-registry'",

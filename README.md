@@ -190,6 +190,41 @@ REGISTRIES_JSON = "[{ \"registry\": \"https://index.docker.io/\" }]"
 
 You can also set your `docker.io` credentials in the configuration to not have any rate-limiting.
 
+### Using the registry from another Worker
+
+The package can be a dependency of another Worker that does its own routing and hands registry requests to the
+registry. Wrangler bundles the TypeScript sources directly, so there is no build step. Pin a commit:
+
+```jsonc
+// package.json of your Worker
+"dependencies": {
+  "r2-registry": "github:cloudflare/serverless-registry#<commit>"
+}
+```
+
+```ts
+import registry, { type RegistryEnv } from "r2-registry";
+
+interface Env extends RegistryEnv {
+  // your own bindings
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    const { pathname } = new URL(request.url);
+    if (pathname === "/v2" || pathname.startsWith("/v2/")) {
+      return registry.fetch(request, env, ctx);
+    }
+    return new Response("Not Found", { status: 404 });
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+`registry.fetch(request, env, ctx)` takes the same bindings and variables as a standalone deployment (`RegistryEnv`):
+an R2 bucket bound as `REGISTRY`, and the authentication variables described above. The Worker needs the
+`nodejs_compat` compatibility flag. The registry only answers paths under `/v2/`, and it uses the request URL for
+authentication challenges and upload locations, so pass the request through with its path unchanged.
+
 ### Known limitations
 
 Right now there is some limitations with this container registry.
