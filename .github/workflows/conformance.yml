@@ -1,0 +1,145 @@
+name: Conformance
+
+# Runs the OCI distribution-spec conformance suite against the registry served by `wrangler dev`.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  conformance:
+    name: OCI conformance (v1.1.1)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Checkout the conformance suite
+        uses: actions/checkout@v6
+        with:
+          repository: opencontainers/distribution-spec
+          ref: v1.1.1
+          path: distribution-spec
+          persist-credentials: false
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+      - name: Use Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: "pnpm"
+      - name: Use Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: distribution-spec/conformance/go.mod
+          cache-dependency-path: distribution-spec/conformance/go.sum
+
+      - run: pnpm install
+      - name: Build the conformance suite
+        working-directory: distribution-spec/conformance
+        run: go test -c -o "$RUNNER_TEMP/conformance.test"
+      - name: Start the registry
+        run: ./.github/scripts/start-registry.sh 5000 "$RUNNER_TEMP/registry"
+      - name: Run the conformance suite
+        env:
+          OCI_ROOT_URL: http://127.0.0.1:5000
+          OCI_NAMESPACE: conformance/repo1
+          OCI_CROSSMOUNT_NAMESPACE: conformance/repo2
+          OCI_USERNAME: hello
+          OCI_PASSWORD: world
+          OCI_TEST_PULL: 1
+          OCI_TEST_PUSH: 1
+          OCI_TEST_CONTENT_DISCOVERY: 1
+          OCI_TEST_CONTENT_MANAGEMENT: 1
+          OCI_HIDE_SKIPPED_WORKFLOWS: 0
+          OCI_DEBUG: 0
+        run: |
+          mkdir -p "$RUNNER_TEMP/results"
+          cd "$RUNNER_TEMP/results"
+          OCI_REPORT_DIR="$RUNNER_TEMP/results" "$RUNNER_TEMP/conformance.test"
+      - name: Show the registry log
+        if: failure()
+        run: tail -n 200 "$RUNNER_TEMP/registry/wrangler.log"
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: conformance-v1.1.1
+          path: ${{ runner.temp }}/results
+          if-no-files-found: ignore
+
+  conformance-main:
+    # The suite on distribution-spec's main branch is still changing, so this job only reports: a
+    # failing suite is shown in the job summary but does not fail the job.
+    name: OCI conformance (main, non-blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Checkout the conformance suite
+        uses: actions/checkout@v6
+        with:
+          repository: opencontainers/distribution-spec
+          ref: main
+          path: distribution-spec
+          persist-credentials: false
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+      - name: Use Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: "pnpm"
+      - name: Use Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: distribution-spec/conformance/go.mod
+          cache-dependency-path: distribution-spec/conformance/go.sum
+
+      - run: pnpm install
+      - name: Build the conformance suite
+        working-directory: distribution-spec/conformance
+        run: go build -o "$RUNNER_TEMP/conformance" .
+      - name: Start the registry
+        run: ./.github/scripts/start-registry.sh 5000 "$RUNNER_TEMP/registry"
+      - name: Run the conformance suite
+        id: suite
+        continue-on-error: true
+        shell: bash
+        env:
+          OCI_VERSION: "1.1"
+          OCI_REGISTRY: 127.0.0.1:5000
+          OCI_TLS: disabled
+          OCI_REPO1: conformance/repo1
+          OCI_REPO2: conformance/repo2
+          OCI_USERNAME: hello
+          OCI_PASSWORD: world
+          # sha512 digests are not supported yet
+          OCI_DATA_SHA512: "false"
+          OCI_LOG: error
+        run: |
+          mkdir -p "$RUNNER_TEMP/results"
+          cd "$RUNNER_TEMP/results"
+          OCI_RESULTS_DIR="$RUNNER_TEMP/results" "$RUNNER_TEMP/conformance" | tee "$RUNNER_TEMP/results/output.txt"
+      - name: Summarize
+        if: always()
+        env:
+          OUTCOME: ${{ steps.suite.outcome }}
+        run: |
+          {
+            echo "### OCI conformance, distribution-spec main: $OUTCOME"
+            echo '```'
+            sed -n '/OCI Conformance Result/,$p' "$RUNNER_TEMP/results/output.txt" 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: conformance-main
+          path: ${{ runner.temp }}/results
+          if-no-files-found: ignore

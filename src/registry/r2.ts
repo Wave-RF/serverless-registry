@@ -9,10 +9,10 @@ import {
   limit,
   split,
 } from "../chunk";
-import { InternalError, ManifestError, RangeError, ServerError } from "../errors";
+import { ImmutableTagError, InternalError, ManifestError, RangeError, ServerError } from "../errors";
 import { SHA256_PREFIX_LEN, getSHA256, hexToDigest, isValidDigest } from "../user";
-import { readableToBlob, readerToBlob, wrap } from "../utils";
-import { BlobUnknownError, ManifestUnknownError } from "../v2-errors";
+import { errorString, jsonHeaders, readableToBlob, readerToBlob, wrap } from "../utils";
+import { BlobUnknownError, DigestInvalidError, ManifestUnknownError } from "../v2-errors";
 import {
   CheckLayerResponse,
   CheckManifestResponse,
@@ -28,11 +28,58 @@ import {
   UploadId,
   UploadObject,
   wrapError,
+  BlobRangeRequest,
 } from "./registry";
 import { GarbageCollectionMode, GarbageCollector } from "./garbage-collector";
-import { ManifestSchema, manifestSchema } from "../manifest";
+import { ManifestSchema, manifestSchema, manifestIssueMessage, withInferredMediaType } from "../manifest";
+import { isImmutableTagReference, resolveImmutableTagPattern } from "./tag-policy";
 
-export const ociImageIndexContentType = "application/vnd.oci.image.index.v1+json";
+export { ociImageIndexContentType } from "../manifest";
+
+function rangeNotSatisfiableResponse(size: number): Response {
+  return new Response(null, {
+    status: 416,
+    headers: {
+      "Content-Range": `bytes */${size}`,
+      "Accept-Ranges": "bytes",
+    },
+  });
+}
+
+/**
+ * Writes a content-addressed object only if it does not exist yet, and treats an existing object as
+ * success. These keys (a blob or manifest stored under its digest, a mounted blob, a referrer entry)
+ * always describe the same content, so an existing object means the write already happened. Never
+ * overwriting them keeps pushes working on buckets whose content prefixes refuse overwrites, such as
+ * R2 buckets with bucket locks or other retention rules, and avoids rewriting large blobs on re-push.
+ *
+ * Returns the stored object, or the object that was already there.
+ */
+export async function putIfAbsent(
+  bucket: R2Bucket,
+  key: string,
+  value: ReadableStream | ArrayBuffer | ArrayBufferView | string | null | Blob,
+  options: R2PutOptions = {},
+): Promise<R2Object> {
+  let created: R2Object | null;
+  try {
+    created = await bucket.put(key, value, { ...options, onlyIf: { etagDoesNotMatch: "*" } });
+  } catch (err) {
+    // A retention rule can refuse the write outright instead of failing the precondition. That is
+    // still success when the object is already there.
+    const existing = await bucket.head(key);
+    if (existing !== null) return existing;
+    throw err;
+  }
+
+  if (created !== null) return created;
+  const existing = await bucket.head(key);
+  if (existing === null) {
+    throw new Error(`conditional write of ${key} was refused, but the object does not exist`);
+  }
+
+  return existing;
+}
 
 function referrersPrefix(name: string, digest: string): string {
   return `${name}/_referrers/${digest}/`;
@@ -198,6 +245,8 @@ export async function encodeState(state: State, env: Env): Promise<{ jwt: string
 }
 
 export const symlinkHeader = "X-Serverless-Registry-Symlink";
+export const symlinkDigestHeader = "X-Serverless-Registry-Symlink-Digest";
+export const symlinkSizeHeader = "X-Serverless-Registry-Symlink-Size";
 
 export async function getUploadState(
   name: string,
@@ -359,15 +408,10 @@ export class R2Registry implements Registry {
 
   async verifyManifest(name: string, manifest: ManifestSchema) {
     if (manifest.schemaVersion === 2 && "manifests" in manifest) {
-      for (const manifestElement of manifest.manifests) {
-        const key = manifestElement.digest;
-        const res = await this.env.REGISTRY.head(`${name}/manifests/${key}`);
-        if (res === null) {
-          console.error(`Manifest with digest ${key} doesn't exist`);
-          return new ManifestError("BLOB_UNKNOWN", `unknown manifest ${key}`);
-        }
-      }
-
+      // Sparse indexes are allowed: when only some platforms of an image are mirrored (regsync
+      // `platforms`), the original index is pushed unchanged so its digest stays the one upstream
+      // has, and the manifests of the other platforms simply do not exist here. Pulling one of
+      // those platforms fails with MANIFEST_UNKNOWN.
       return null;
     }
 
@@ -509,6 +553,17 @@ export class R2Registry implements Registry {
     shaWriter.close();
     const digest = await sha256.digest;
     const digestStr = hexToDigest(digest);
+
+    // A reference containing ":" addresses the manifest by digest (an OCI tag never contains ":").
+    // The submitted content must hash to exactly that digest; a mismatched or malformed digest
+    // reference is a client error (400 DIGEST_INVALID), not a tag to store under the wrong key.
+    if (reference.includes(":") && reference !== digestStr) {
+      const message = isValidDigest(reference)
+        ? `provided digest ${reference} does not match content digest ${digestStr}`
+        : `invalid digest reference ${reference}`;
+      return { response: new ManifestError("DIGEST_INVALID", message) };
+    }
+
     const text = await blob.text();
     let manifestJSON: unknown;
     try {
@@ -519,12 +574,10 @@ export class R2Registry implements Registry {
       };
     }
 
-    const manifestResult = manifestSchema.safeParse(manifestJSON);
+    const manifestResult = manifestSchema.safeParse(withInferredMediaType(manifestJSON, contentType));
     if (!manifestResult.success) {
-      const firstIssue = manifestResult.error.issues[0];
-      const path = firstIssue?.path.length ? `${firstIssue.path.join(".")}: ` : "";
       return {
-        response: new ManifestError("MANIFEST_INVALID", `${path}${firstIssue?.message ?? "invalid manifest"}`),
+        response: new ManifestError("MANIFEST_INVALID", manifestIssueMessage(manifestResult.error)),
       };
     }
 
@@ -535,17 +588,9 @@ export class R2Registry implements Registry {
         response: new ManifestError("MANIFEST_INVALID", `invalid subject digest ${subjectDigest}`),
       };
     }
-    if (subjectDigest !== undefined) {
-      const [subjectManifest, subjectManifestErr] = await wrap(env.REGISTRY.head(`${name}/manifests/${subjectDigest}`));
-      if (subjectManifestErr) {
-        return wrapError("putManifestInner", subjectManifestErr);
-      }
-      if (subjectManifest === null) {
-        return {
-          response: new ManifestError("BLOB_UNKNOWN", `unknown subject ${subjectDigest}`),
-        };
-      }
-    }
+    // The subject does not have to exist yet: the OCI distribution spec (v1.1) allows pushing a
+    // referrer before its subject, and copy tools like regsync push the manifests of an index in
+    // parallel, so buildx attestations regularly arrive before the image they describe.
 
     const referrerDescriptor = descriptorFromManifest(manifest, digestStr, blob.size);
     if (checkLayers) {
@@ -562,42 +607,66 @@ export class R2Registry implements Registry {
       hasSubject: subjectDigest !== undefined ? "true" : "false",
       ...(subjectDigest !== undefined ? { subjectDigest } : {}),
     };
+    const immutablePattern = resolveImmutableTagPattern(env.IMMUTABLE_TAG_PATTERN);
 
-    const putReference = async () => {
-      // if the reference is the same as a digest, it's not necessary to insert
-      if (reference === digestStr) return;
-      return await env.REGISTRY.put(`${name}/manifests/${reference}`, text, {
-        sha256: digest,
-        httpMetadata: {
-          contentType,
-        },
-        customMetadata,
-      });
+    const putOptions = {
+      sha256: digest,
+      httpMetadata: {
+        contentType,
+      },
+      customMetadata,
     };
 
-    const putTasks: Promise<unknown>[] = [
-      putReference(),
-      // this is the "main" manifest
-      env.REGISTRY.put(`${name}/manifests/${digestStr}`, text, {
-        sha256: digest,
-        httpMetadata: {
-          contentType,
-        },
-        customMetadata,
-      }),
-    ];
-
-    if (referrerDescriptor !== null && subjectDigest !== undefined) {
-      putTasks.push(
-        env.REGISTRY.put(referrersPath(name, subjectDigest, digestStr), JSON.stringify(referrerDescriptor), {
+    const putReferrer = () => {
+      if (referrerDescriptor === null || subjectDigest === undefined) {
+        return null;
+      }
+      return putIfAbsent(
+        env.REGISTRY,
+        referrersPath(name, subjectDigest, digestStr),
+        JSON.stringify(referrerDescriptor),
+        {
           httpMetadata: {
             contentType: "application/json",
           },
-        }),
+        },
       );
-    }
+    };
+    const digestPut = () => putIfAbsent(env.REGISTRY, `${name}/manifests/${digestStr}`, text, putOptions);
+    const immutableReference = reference !== digestStr && isImmutableTagReference(reference, immutablePattern);
 
-    await Promise.all(putTasks);
+    if (immutableReference) {
+      // The digest must be durable before the protected tag becomes visible,
+      // and only an accepted tag may publish derived referrer state.
+      await digestPut();
+      const referenceKey = `${name}/manifests/${reference}`;
+      const created = await env.REGISTRY.put(referenceKey, text, {
+        ...putOptions,
+        onlyIf: { etagDoesNotMatch: "*" },
+      });
+      if (created === null) {
+        const existing = await env.REGISTRY.head(referenceKey);
+        const existingDigest = existing?.checksums.sha256 ? hexToDigest(existing.checksums.sha256) : undefined;
+        if (existingDigest !== digestStr) {
+          return { response: new ImmutableTagError(reference) };
+        }
+      }
+
+      const referrerPut = putReferrer();
+      if (referrerPut !== null) {
+        await referrerPut;
+      }
+    } else {
+      const putTasks: Promise<unknown>[] = [digestPut()];
+      if (reference !== digestStr) {
+        putTasks.push(env.REGISTRY.put(`${name}/manifests/${reference}`, text, putOptions));
+      }
+      const referrerPut = putReferrer();
+      if (referrerPut !== null) {
+        putTasks.push(referrerPut);
+      }
+      await Promise.all(putTasks);
+    }
     return {
       digest: hexToDigest(digest),
       location: `/v2/${name}/manifests/${reference}`,
@@ -650,11 +719,22 @@ export class R2Registry implements Registry {
       // Trying to mount a layer from sourceLayerPath to destinationLayerPath
 
       // Create linked file with custom metadata
+      if (res.checksums.sha256 === null) {
+        return { response: new ServerError("invalid checksum from R2 backend") };
+      }
       const [newFile, error] = await wrap(
-        this.env.REGISTRY.put(destinationLayerPath, sourceLayerPath, {
+        putIfAbsent(this.env.REGISTRY, destinationLayerPath, sourceLayerPath, {
+          // Symlink object content is the source blob path string.
+          // The object checksum must match the symlink payload to satisfy R2.
           sha256: await getSHA256(sourceLayerPath, ""),
           httpMetadata: res.httpMetadata,
-          customMetadata: { [symlinkHeader]: sourceName }, // Storing target repository name in metadata (to easily resolve recursive layer mounting)
+          customMetadata: {
+            // Storing target repository name in metadata (to easily resolve recursive layer mounting)
+            [symlinkHeader]: sourceName,
+            // Store source layer metadata so HEAD can answer without loading symlink body.
+            [symlinkDigestHeader]: digest,
+            [symlinkSizeHeader]: `${res.size}`,
+          },
         }),
       );
       if (error) {
@@ -683,6 +763,63 @@ export class R2Registry implements Registry {
       };
     }
 
+    const expectedDigest = tag.startsWith("sha256:") ? tag : null;
+    const actualDigest = res.checksums.sha256 ? hexToDigest(res.checksums.sha256) : null;
+    const symlinkByChecksumMismatch =
+      expectedDigest !== null && actualDigest !== null && actualDigest !== expectedDigest;
+    const symlinkMetadata = res.customMetadata ?? {};
+    const symlinkByMetadata = symlinkHeader in symlinkMetadata;
+
+    // Handle R2 symlink layers.
+    // We detect symlinks by:
+    // 1) explicit metadata, or
+    // 2) checksum mismatch between requested digest and R2 object checksum
+    //    (the symlink object checksum is based on symlink payload, not mounted blob bytes).
+    if (symlinkByMetadata || symlinkByChecksumMismatch) {
+      // Fast path for symlinks created by newer versions that include source metadata.
+      const metadataSize = +(symlinkMetadata[symlinkSizeHeader] ?? "");
+      const metadataDigest = symlinkMetadata[symlinkDigestHeader];
+      if (Number.isFinite(metadataSize) && metadataSize >= 0 && metadataDigest) {
+        return {
+          digest: metadataDigest,
+          size: metadataSize,
+          exists: true,
+        };
+      }
+
+      // Backward-compatibility path for old symlinks: resolve link body and query target.
+      const [obj, getErr] = await wrap(this.env.REGISTRY.get(`${name}/blobs/${tag}`));
+      if (getErr) {
+        return wrapError("layerExists", getErr);
+      }
+      if (!obj) {
+        return { exists: false };
+      }
+
+      const layerPath = await obj.text();
+      const [linkName, linkDigest] = layerPath.split("/blobs/");
+      if (!linkName || !linkDigest) {
+        // Backward compatibility: if this does not look like a symlink payload,
+        // fall back to object metadata from HEAD.
+        if (res.checksums.sha256 === null) {
+          return { response: new ServerError("invalid checksum from R2 backend") };
+        }
+
+        return {
+          digest: hexToDigest(res.checksums.sha256!),
+          size: res.size,
+          exists: true,
+        };
+      }
+
+      // Prevent recursive self-reference.
+      if (linkName === name && linkDigest === tag) {
+        return { exists: false };
+      }
+
+      return await this.env.REGISTRY_CLIENT.layerExists(linkName, linkDigest);
+    }
+
     return {
       digest: hexToDigest(res.checksums.sha256!),
       size: res.size,
@@ -690,8 +827,87 @@ export class R2Registry implements Registry {
     };
   }
 
-  async getLayer(name: string, digest: string): Promise<RegistryError | GetLayerResponse> {
-    const [res, err] = await wrap(this.env.REGISTRY.get(`${name}/blobs/${digest}`));
+  async getLayer(name: string, digest: string, range?: BlobRangeRequest): Promise<RegistryError | GetLayerResponse> {
+    const key = `${name}/blobs/${digest}`;
+
+    if (range === undefined) {
+      const [res, err] = await wrap(this.env.REGISTRY.get(key));
+      if (err) {
+        return wrapError("getLayer", err);
+      }
+
+      if (!res) {
+        return {
+          response: new Response(JSON.stringify(BlobUnknownError), { status: 404 }),
+        };
+      }
+
+      // Handle R2 symlink
+      if (res.customMetadata && symlinkHeader in res.customMetadata) {
+        return await this.followLayerSymlink(name, digest, res, undefined);
+      }
+
+      return {
+        stream: res.body!,
+        digest: hexToDigest(res.checksums.sha256!),
+        size: res.size,
+      };
+    }
+
+    // Ranged read: inspect object metadata first so we can validate the requested range and
+    // resolve symlinks without streaming the full object.
+    const [head, headErr] = await wrap(this.env.REGISTRY.head(key));
+    if (headErr) {
+      return wrapError("getLayer", headErr);
+    }
+
+    if (!head) {
+      return {
+        response: new Response(JSON.stringify(BlobUnknownError), { status: 404 }),
+      };
+    }
+
+    if (head.customMetadata && symlinkHeader in head.customMetadata) {
+      const [link, linkErr] = await wrap(this.env.REGISTRY.get(key));
+      if (linkErr) {
+        return wrapError("getLayer", linkErr);
+      }
+
+      if (!link) {
+        return {
+          response: new Response(JSON.stringify(BlobUnknownError), { status: 404 }),
+        };
+      }
+
+      return await this.followLayerSymlink(name, digest, link, range);
+    }
+
+    const totalSize = head.size;
+    let start: number;
+    let end: number;
+    if ("suffix" in range) {
+      // A suffix longer than the object is satisfied by the whole object, but a zero-length suffix
+      // selects no bytes at all and cannot be satisfied.
+      if (range.suffix <= 0 || totalSize === 0) {
+        return { response: rangeNotSatisfiableResponse(totalSize) };
+      }
+
+      start = Math.max(totalSize - range.suffix, 0);
+      end = totalSize - 1;
+    } else {
+      start = range.offset;
+      if (start < 0 || start >= totalSize) {
+        return { response: rangeNotSatisfiableResponse(totalSize) };
+      }
+
+      end = range.end === undefined ? totalSize - 1 : Math.min(range.end, totalSize - 1);
+      if (end < start) {
+        return { response: rangeNotSatisfiableResponse(totalSize) };
+      }
+    }
+
+    const length = end - start + 1;
+    const [res, err] = await wrap(this.env.REGISTRY.get(key, { range: { offset: start, length } }));
     if (err) {
       return wrapError("getLayer", err);
     }
@@ -702,24 +918,29 @@ export class R2Registry implements Registry {
       };
     }
 
-    // Handle R2 symlink
-    if (res.customMetadata && symlinkHeader in res.customMetadata) {
-      const layerPath = await res.text();
-      // Symlink detected! Will download layer from "layerPath"
-      const [linkName, linkDigest] = layerPath.split("/blobs/");
-      if (linkName == name && linkDigest == digest) {
-        return {
-          response: new Response(JSON.stringify(BlobUnknownError), { status: 404 }),
-        };
-      }
-      return await this.env.REGISTRY_CLIENT.getLayer(linkName, linkDigest);
-    }
-
     return {
       stream: res.body!,
-      digest: hexToDigest(res.checksums.sha256!),
-      size: res.size,
+      digest: hexToDigest(head.checksums.sha256!),
+      size: totalSize,
+      contentRange: { start, end, size: totalSize },
     };
+  }
+
+  private async followLayerSymlink(
+    name: string,
+    digest: string,
+    object: R2ObjectBody,
+    range: BlobRangeRequest | undefined,
+  ): Promise<RegistryError | GetLayerResponse> {
+    const layerPath = await object.text();
+    // Symlink detected! Will download layer from "layerPath"
+    const [linkName, linkDigest] = layerPath.split("/blobs/");
+    if (linkName == name && linkDigest == digest) {
+      return {
+        response: new Response(JSON.stringify(BlobUnknownError), { status: 404 }),
+      };
+    }
+    return await this.env.REGISTRY_CLIENT.getLayer(linkName, linkDigest, range);
   }
 
   async startUpload(namespace: string): Promise<RegistryError | UploadObject> {
@@ -898,8 +1119,10 @@ export class R2Registry implements Registry {
             httpMetadata: new Headers(headers),
             customMetadata: headers,
           });
-          state.parts.push(await partTask);
-          await r2RegistryObjectTask;
+
+          // Run both in parallel and wait for both to complete
+          const [part] = await Promise.all([partTask, r2RegistryObjectTask]);
+          state.parts.push(part);
           return;
         }
 
@@ -927,7 +1150,9 @@ export class R2Registry implements Registry {
     };
 
     if (length === undefined) {
-      console.error("Length needs to be defined");
+      console.error(
+        "Length needs to be defined for streaming upload to R2. Ensure Content-Length or Content-Range is provided.",
+      );
       return {
         response: new InternalError(),
       };
@@ -975,14 +1200,36 @@ export class R2Registry implements Registry {
     const state = hashedState.state;
 
     const uuid = state.registryUploadId;
-    if (state.parts.length === 0) {
-      if (!stream) {
-        console.error("There has been an upload with zero parts and the body is null");
+
+    // Commit the finished content under the client-claimed digest. R2 verifies the sha256 we
+    // hand it against the bytes it stored, so a digest the client got wrong surfaces here as a
+    // checksum-mismatch rejection — translate that into a 400 DIGEST_INVALID rather than letting
+    // it bubble up as an opaque 500. Any other failure is a genuine server error.
+    const putBlob = async (body: ReadableStream | Uint8Array | null): Promise<RegistryError | null> => {
+      const [, err] = await wrap(
+        putIfAbsent(this.env.REGISTRY, `${namespace}/blobs/${expectedSha}`, body, {
+          sha256: (expectedSha as string).slice(SHA256_PREFIX_LEN),
+        }),
+      );
+      if (err === null) return null;
+      const message = errorString(err);
+      // Matches the wording R2 uses when the stored bytes don't hash to the requested sha256.
+      // This couples to the runtime's error text; the unit test asserts the 400 body so a future
+      // wording change surfaces as a test failure rather than a silent regression to 500.
+      if (/checksum|did not match/i.test(message)) {
         return {
-          response: new InternalError(),
+          response: new Response(JSON.stringify(DigestInvalidError()), { status: 400, headers: jsonHeaders() }),
         };
       }
+      console.error("finishUpload put failed:", message);
+      return { response: new InternalError() };
+    };
 
+    if (state.parts.length === 0) {
+      // No multipart parts were staged: the whole blob arrives in this request body (a monolithic
+      // PUT), or it is a zero-byte blob. An absent body is a valid empty blob — store empty bytes
+      // (R2 requires a known-length body, so a length-less empty stream cannot be used here) and
+      // let the checksum check confirm the client really claimed the empty digest.
       if (length && length > MAXIMUM_CHUNK) {
         console.error("Surpasses MAXIMUM_CHUNK");
         return {
@@ -990,20 +1237,19 @@ export class R2Registry implements Registry {
         };
       }
 
-      await this.env.REGISTRY.put(`${namespace}/blobs/${expectedSha}`, stream, {
-        sha256: (expectedSha as string).slice(SHA256_PREFIX_LEN),
-      });
+      // With bytes to store, the request body carries its own (known) length. With none, it is a
+      // zero-byte blob — hand R2 empty bytes rather than a length-less empty stream, which it rejects.
+      const putErr = await putBlob(length && length > 0 ? stream! : new Uint8Array(0));
+      if (putErr) return putErr;
     } else {
       const upload = this.env.REGISTRY.resumeMultipartUpload(uuid, state.uploadId);
-      // TODO: Handle one last buffer here
+      // A final chunk carried by the finalizing PUT is appended beforehand via uploadChunk (the
+      // same path a PATCH uses), so the staged parts are complete here. See the PUT handler.
       await upload.complete(state.parts);
       const obj = await this.env.REGISTRY.get(uuid);
-      const put = this.env.REGISTRY.put(`${namespace}/blobs/${expectedSha}`, obj!.body, {
-        sha256: (expectedSha as string).slice(SHA256_PREFIX_LEN),
-      });
-
-      await put;
+      const putErr = await putBlob(obj!.body);
       await this.env.REGISTRY.delete(uuid);
+      if (putErr) return putErr;
     }
 
     await this.env.REGISTRY.delete(getRegistryUploadsPath(state));
@@ -1048,7 +1294,7 @@ export class R2Registry implements Registry {
       return false;
     }
 
-    await this.env.REGISTRY.put(`${namespace}/blobs/${sha256}`, stream, {
+    await putIfAbsent(this.env.REGISTRY, `${namespace}/blobs/${sha256}`, stream, {
       sha256: (sha256 as string).slice(SHA256_PREFIX_LEN),
     });
     return {

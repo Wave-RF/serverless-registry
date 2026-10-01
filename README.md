@@ -99,6 +99,52 @@ docker rmi ubuntu:latest $REGISTRY_URL/ubuntu:latest
 docker pull $REGISTRY_URL/ubuntu:latest
 ```
 
+### Allowing anonymous pulls
+
+Set `ANONYMOUS_PULL_REPOSITORIES` to a comma or space separated list of repository names that can be pulled without
+credentials. `*` matches any characters, including `/`, so `public/*` allows every repository under `public/` and `*`
+allows all of them. Requests without an `Authorization` header can then read the manifests, blobs, tags and referrers
+of those repositories. Everything else still needs credentials: pushes, deletes, uploads, `/v2/_catalog` and garbage
+collection. `/v2/` keeps answering `401` so that clients still log in before they push, requests with wrong
+credentials are still refused, and anonymous requests never use the pull fallback below.
+
+### Protecting immutable release tags
+
+Set `IMMUTABLE_TAG_PATTERN` under `[env.production.vars]` to a JavaScript regular expression that must match the
+entire protected tag. For example, this protects strict `vX.Y.Z` releases while leaving `latest` mutable:
+
+```toml
+IMMUTABLE_TAG_PATTERN = 'v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)'
+```
+
+Protected tags are created with an atomic conditional R2 write. Retrying the same manifest digest is idempotent;
+attempting to assign a different digest returns `409` with the OCI `DENIED` error code. Protected tags cannot be
+deleted directly. While the policy is enabled, the API rejects every
+delete-by-digest request because alias discovery and digest deletion cannot be made atomic across R2 keys. Delete an
+unprotected tag by name and let untagged garbage collection remove its content. Direct blob deletion is also disabled
+because deleting a referenced layer or config would make a protected release unpullable. An invalid expression fails
+manifest writes before any manifest object is stored.
+
+The policy is enforced at the Worker API boundary. To preserve the invariant, restrict direct R2 write access and
+route registry writes through this Worker.
+
+### Disabling deletion
+
+Set `DISABLE_DELETE = "true"` to make the registry append-only. Deleting manifests (by tag or by digest), deleting
+blobs and garbage collection (`POST /v2/<name>/gc`) then answer `405 Method Not Allowed` with the OCI `UNSUPPORTED`
+error code. Pushing, and moving a tag that is not protected by `IMMUTABLE_TAG_PATTERN`, keep working. Cancelling an
+upload in progress is not affected, because it only removes temporary upload state.
+
+### Using buckets with retention rules
+
+Blobs, manifests stored under their digest and referrer entries are written once and never overwritten: a push of
+content that already exists leaves the stored object alone. The registry therefore works on an R2 bucket whose
+content keys are protected by [bucket locks](https://developers.cloudflare.com/r2/buckets/bucket-locks/) or other
+retention rules. Those keys are `<repository>/blobs/<digest>`, `<repository>/manifests/sha256:<hex>` and
+`<repository>/_referrers/<subject digest>/<referrer digest>`. Tags (`<repository>/manifests/<tag>`) and upload state
+are rewritten and deleted, so keep them outside such rules, and set `DISABLE_DELETE` so that deletes fail cleanly
+instead of hitting the lock.
+
 ### Configuring Pull fallback
 
 You can configure the R2 registry to fallback to another registry if
@@ -162,6 +208,41 @@ REGISTRIES_JSON = "[{ \"registry\": \"https://index.docker.io/\" }]"
 ```
 
 You can also set your `docker.io` credentials in the configuration to not have any rate-limiting.
+
+### Using the registry from another Worker
+
+The package can be a dependency of another Worker that does its own routing and hands registry requests to the
+registry. Wrangler bundles the TypeScript sources directly, so there is no build step. Pin a commit:
+
+```jsonc
+// package.json of your Worker
+"dependencies": {
+  "r2-registry": "github:cloudflare/serverless-registry#<commit>"
+}
+```
+
+```ts
+import registry, { type RegistryEnv } from "r2-registry";
+
+interface Env extends RegistryEnv {
+  // your own bindings
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    const { pathname } = new URL(request.url);
+    if (pathname === "/v2" || pathname.startsWith("/v2/")) {
+      return registry.fetch(request, env, ctx);
+    }
+    return new Response("Not Found", { status: 404 });
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+`registry.fetch(request, env, ctx)` takes the same bindings and variables as a standalone deployment (`RegistryEnv`):
+an R2 bucket bound as `REGISTRY`, and the authentication variables described above. The Worker needs the
+`nodejs_compat` compatibility flag. The registry only answers paths under `/v2/`, and it uses the request URL for
+authentication challenges and upload locations, so pass the request through with its path unchanged.
 
 ### Known limitations
 

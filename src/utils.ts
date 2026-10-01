@@ -75,3 +75,25 @@ export function base64UrlDecode(s: string): string {
 export function base64UrlEncode(s: string): string {
   return Buffer.from(s, "utf8").toString("base64url");
 }
+
+/**
+ * Get the estimated size of the stream (if possible).
+ * Does not wait for the entire stream, only checks if known length information is available.
+ */
+export function getStreamSize(headers: Headers): number | undefined {
+  const contentLength = headers.get("Content-Length");
+  if (contentLength) {
+    return +contentLength;
+  }
+
+  const contentRange = headers.get("Content-Range");
+  if (contentRange) {
+    // Supported formats: 'bytes 0-123/456', 'bytes 0-123/*', '0-123'
+    const match = contentRange.match(/(?:bytes\s+)?(\d+)-(\d+)/);
+    if (match) {
+      return parseInt(match[2], 10) - parseInt(match[1], 10) + 1;
+    }
+  }
+
+  return undefined;
+}

@@ -72,7 +72,8 @@ export class InternalError extends Response {
 
 export class ManifestError extends Response {
   constructor(
-    code: "MANIFEST_INVALID" | "BLOB_UNKNOWN" | "MANIFEST_UNVERIFIED" | "TAG_INVALID" | "NAME_INVALID",
+    code:
+      "MANIFEST_INVALID" | "BLOB_UNKNOWN" | "MANIFEST_UNVERIFIED" | "TAG_INVALID" | "NAME_INVALID" | "DIGEST_INVALID",
     message: string,
     detail: Record<string, string> = {},
   ) {
@@ -91,6 +92,68 @@ export class ManifestError extends Response {
         "content-type": "application/json;charset=UTF-8",
       },
     });
+  }
+}
+
+export class ImmutableTagError extends Response {
+  constructor(reference: string, action = "reassigned") {
+    super(
+      JSON.stringify({
+        errors: [
+          {
+            code: "DENIED",
+            message: `immutable tag ${reference} cannot be ${action}`,
+            detail: { reference },
+          },
+        ],
+      }),
+      {
+        status: 409,
+        headers: {
+          "content-type": "application/json;charset=UTF-8",
+        },
+      },
+    );
+  }
+}
+
+export class ImmutableBlobError extends Response {
+  constructor(digest: string) {
+    super(
+      JSON.stringify({
+        errors: [
+          {
+            code: "DENIED",
+            message: `blob ${digest} cannot be deleted while immutable tag policy is enabled`,
+            detail: { digest },
+          },
+        ],
+      }),
+      {
+        status: 409,
+        headers: {
+          "content-type": "application/json;charset=UTF-8",
+        },
+      },
+    );
+  }
+}
+
+// Returned for every delete when DISABLE_DELETE is set. The OCI distribution spec allows a registry
+// to disable deletion and answer 405 Method Not Allowed.
+export class DeletionDisabledError extends Response {
+  constructor() {
+    super(
+      JSON.stringify({
+        errors: [{ code: "UNSUPPORTED", message: "deleting is disabled on this registry", detail: null }],
+      }),
+      {
+        status: 405,
+        headers: {
+          "content-type": "application/json;charset=UTF-8",
+        },
+      },
+    );
   }
 }
 

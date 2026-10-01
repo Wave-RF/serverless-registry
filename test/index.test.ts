@@ -13,6 +13,7 @@ import worker from "../index";
 import { env } from "cloudflare:workers";
 import { createExecutionContext, reset, waitOnExecutionContext } from "cloudflare:test";
 import { base64UrlEncode } from "../src/utils";
+import { anonymousPullPatterns, anonymousPullRepository } from "../src/anonymous";
 
 afterEach(async () => {
   await reset();
@@ -311,6 +312,47 @@ async function seedReferrerIndex(name: string, subjectDigest: string, descriptor
 }
 
 describe("v2 manifests", () => {
+  test("PUT /v2/:name/manifests/:reference infers mediaType from Content-Type", async () => {
+    const name = "helm-chart";
+    const bindings = env as Env;
+    // Helm omits the OPTIONAL top-level mediaType; the Content-Type header carries it instead.
+    const withoutMediaType: Record<string, unknown> = { ...getImageManifestV2(await generateManifest(name)) };
+    delete withoutMediaType.mediaType;
+
+    const data = JSON.stringify(withoutMediaType);
+    const sha256 = await getSHA256(data);
+    const response = await fetch(
+      createRequest("PUT", `/v2/${name}/manifests/v1`, new Blob([data]).stream(), {
+        "Content-Type": "application/vnd.oci.image.manifest.v1+json",
+      }),
+    );
+
+    expect(response.ok).toBeTruthy();
+    expect(response.headers.get("docker-content-digest")).toEqual(sha256);
+
+    // The stored bytes must be exactly what was pushed, or they no longer hash to the digest.
+    const stored = await bindings.REGISTRY.get(`${name}/manifests/${sha256}`);
+    expect(await stored?.text()).toEqual(data);
+  });
+
+  test("PUT /v2/:name/manifests/:reference rejects when no mediaType is available at all", async () => {
+    const name = "helm-chart-unknown-content-type";
+    const withoutMediaType: Record<string, unknown> = { ...getImageManifestV2(await generateManifest(name)) };
+    delete withoutMediaType.mediaType;
+
+    const response = await fetch(
+      createRequest("PUT", `/v2/${name}/manifests/v1`, new Blob([JSON.stringify(withoutMediaType)]).stream(), {
+        "Content-Type": "application/gzip",
+      }),
+    );
+
+    expect(response.status).toEqual(400);
+    const body = (await response.json()) as { errors: { code: string; message: string }[] };
+    expect(body.errors[0].code).toEqual("MANIFEST_INVALID");
+    // the union error must name the offending field rather than a bare "Invalid input"
+    expect(body.errors[0].message).toContain("mediaType");
+  });
+
   test("HEAD /v2/:name/manifests/:reference NOT FOUND", async () => {
     const response = await fetch(createRequest("GET", "/v2/notfound/manifests/reference", null));
     expect(response.status).toBe(404);
@@ -344,8 +386,310 @@ describe("v2 manifests", () => {
       "content-length": "2",
       "content-type": "application/gzip",
       "docker-content-digest": sha256,
+      "content-encoding": "identity",
     });
     await bindings.REGISTRY.delete(`${name}/manifests/${reference}`);
+  });
+
+  test("immutable release tag rejects a different manifest without changing its digest", async () => {
+    const bindings = env as Env & { IMMUTABLE_TAG_PATTERN?: string };
+    const previousPattern = bindings.IMMUTABLE_TAG_PATTERN;
+    bindings.IMMUTABLE_TAG_PATTERN = String.raw`^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$`;
+    const name = "immutable-release-overwrite";
+    const tag = "v1.2.3";
+
+    try {
+      const firstManifest = await generateManifest(name);
+      const { sha256: firstDigest } = await createManifest(name, firstManifest, tag);
+      const secondManifest = await generateManifest(name);
+      const response = await fetch(
+        createRequest("PUT", `/v2/${name}/manifests/${tag}`, new Blob([JSON.stringify(secondManifest)]).stream(), {
+          "Content-Type": "application/gzip",
+        }),
+      );
+
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({
+        errors: [expect.objectContaining({ code: "DENIED" })],
+      });
+
+      const stored = await fetch(createRequest("HEAD", `/v2/${name}/manifests/${tag}`, null));
+      expect(stored.headers.get("docker-content-digest")).toBe(firstDigest);
+    } finally {
+      bindings.IMMUTABLE_TAG_PATTERN = previousPattern;
+    }
+  });
+
+  test("concurrent writers cannot assign different manifests to one immutable release tag", async () => {
+    const bindings = env as Env & { IMMUTABLE_TAG_PATTERN?: string };
+    const previousPattern = bindings.IMMUTABLE_TAG_PATTERN;
+    bindings.IMMUTABLE_TAG_PATTERN = String.raw`^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$`;
+    const name = "immutable-release-concurrent";
+    const tag = "v1.2.3";
+
+    try {
+      const manifests = [await generateManifest(name), await generateManifest(name)];
+      const manifestData = manifests.map((manifest) => JSON.stringify(manifest));
+      const expectedDigests = await Promise.all(manifestData.map((data) => getSHA256(data)));
+      const responses = await Promise.all(
+        manifestData.map((data) =>
+          fetch(
+            createRequest("PUT", `/v2/${name}/manifests/${tag}`, new Blob([data]).stream(), {
+              "Content-Type": "application/gzip",
+            }),
+          ),
+        ),
+      );
+
+      expect(responses.map((response) => response.status).sort()).toEqual([201, 409]);
+      const stored = await fetch(createRequest("HEAD", `/v2/${name}/manifests/${tag}`, null));
+      expect(expectedDigests).toContain(stored.headers.get("docker-content-digest"));
+    } finally {
+      bindings.IMMUTABLE_TAG_PATTERN = previousPattern;
+    }
+  });
+
+  test("immutable release tag accepts an idempotent retry of the same manifest", async () => {
+    const bindings = env as Env & { IMMUTABLE_TAG_PATTERN?: string };
+    const previousPattern = bindings.IMMUTABLE_TAG_PATTERN;
+    bindings.IMMUTABLE_TAG_PATTERN = String.raw`^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$`;
+    const name = "immutable-release-retry";
+    const tag = "v1.2.3";
+
+    try {
+      const manifest = await generateManifest(name);
+      const first = await uploadManifest(name, manifest, tag);
+      const retry = await fetch(
+        createRequest("PUT", `/v2/${name}/manifests/${tag}`, new Blob([JSON.stringify(manifest)]).stream(), {
+          "Content-Type": "application/gzip",
+        }),
+      );
+
+      expect(retry.status).toBe(201);
+      expect(retry.headers.get("docker-content-digest")).toBe(first.sha256);
+    } finally {
+      bindings.IMMUTABLE_TAG_PATTERN = previousPattern;
+    }
+  });
+
+  test("tag outside the immutable pattern remains mutable", async () => {
+    const bindings = env as Env & { IMMUTABLE_TAG_PATTERN?: string };
+    const previousPattern = bindings.IMMUTABLE_TAG_PATTERN;
+    bindings.IMMUTABLE_TAG_PATTERN = String.raw`^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$`;
+    const name = "mutable-operational-tag";
+    const tag = "latest";
+
+    try {
+      const firstManifest = await generateManifest(name);
+      const { sha256: firstDigest } = await createManifest(name, firstManifest, tag);
+      const secondManifest = await generateManifest(name);
+      const { sha256: secondDigest } = await createManifest(name, secondManifest, tag);
+
+      expect(secondDigest).not.toBe(firstDigest);
+      const stored = await fetch(createRequest("HEAD", `/v2/${name}/manifests/${tag}`, null));
+      expect(stored.headers.get("docker-content-digest")).toBe(secondDigest);
+    } finally {
+      bindings.IMMUTABLE_TAG_PATTERN = previousPattern;
+    }
+  });
+
+  test("immutable release tag cannot be deleted", async () => {
+    const bindings = env as Env & { IMMUTABLE_TAG_PATTERN?: string };
+    const previousPattern = bindings.IMMUTABLE_TAG_PATTERN;
+    bindings.IMMUTABLE_TAG_PATTERN = String.raw`^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$`;
+    const name = "immutable-release-delete";
+    const tag = "v1.2.3";
+
+    try {
+      const manifest = await generateManifest(name);
+      const { sha256 } = await createManifest(name, manifest, tag);
+      const response = await fetch(createRequest("DELETE", `/v2/${name}/manifests/${tag}`, null));
+
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({
+        errors: [expect.objectContaining({ code: "DENIED" })],
+      });
+      const stored = await fetch(createRequest("HEAD", `/v2/${name}/manifests/${tag}`, null));
+      expect(stored.headers.get("docker-content-digest")).toBe(sha256);
+    } finally {
+      bindings.IMMUTABLE_TAG_PATTERN = previousPattern;
+    }
+  });
+
+  test("tag outside the immutable pattern remains deletable", async () => {
+    const bindings = env as Env & { IMMUTABLE_TAG_PATTERN?: string };
+    const previousPattern = bindings.IMMUTABLE_TAG_PATTERN;
+    bindings.IMMUTABLE_TAG_PATTERN = String.raw`^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$`;
+    const name = "mutable-operational-tag-delete";
+    const tag = "latest";
+
+    try {
+      await createManifest(name, await generateManifest(name), tag);
+      const response = await fetch(createRequest("DELETE", `/v2/${name}/manifests/${tag}`, null));
+
+      expect(response.status).toBe(202);
+      expect((await fetch(createRequest("HEAD", `/v2/${name}/manifests/${tag}`, null))).status).toBe(404);
+    } finally {
+      bindings.IMMUTABLE_TAG_PATTERN = previousPattern;
+    }
+  });
+
+  test("manifest digest cannot be deleted while an immutable tag points to it", async () => {
+    const bindings = env as Env & { IMMUTABLE_TAG_PATTERN?: string };
+    const previousPattern = bindings.IMMUTABLE_TAG_PATTERN;
+    bindings.IMMUTABLE_TAG_PATTERN = String.raw`^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$`;
+    const name = "immutable-release-digest-delete";
+    const tag = "v1.2.3";
+
+    try {
+      const manifest = await generateManifest(name);
+      const { sha256 } = await createManifest(name, manifest, tag);
+      const response = await fetch(createRequest("DELETE", `/v2/${name}/manifests/${sha256}`, null));
+
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({
+        errors: [expect.objectContaining({ code: "DENIED" })],
+      });
+      expect((await fetch(createRequest("HEAD", `/v2/${name}/manifests/${tag}`, null))).status).toBe(200);
+      expect((await fetch(createRequest("HEAD", `/v2/${name}/manifests/${sha256}`, null))).status).toBe(200);
+    } finally {
+      bindings.IMMUTABLE_TAG_PATTERN = previousPattern;
+    }
+  });
+
+  test("digest deletion is blocked before paginated alias mutation when immutable policy is enabled", async () => {
+    const bindings = env as Env & { IMMUTABLE_TAG_PATTERN?: string };
+    const previousPattern = bindings.IMMUTABLE_TAG_PATTERN;
+    bindings.IMMUTABLE_TAG_PATTERN = String.raw`^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$`;
+    const name = "immutable-release-paginated-digest-delete";
+    const releaseTag = "v1.2.3";
+    const operationalTag = "latest";
+
+    try {
+      const manifest = await generateManifest(name);
+      const { sha256 } = await createManifest(name, manifest, operationalTag);
+      await uploadManifest(name, manifest, releaseTag);
+
+      const response = await fetch(createRequest("DELETE", `/v2/${name}/manifests/${sha256}?limit=1`, null));
+
+      expect(response.status).toBe(409);
+      expect((await fetch(createRequest("HEAD", `/v2/${name}/manifests/${operationalTag}`, null))).status).toBe(200);
+      expect((await fetch(createRequest("HEAD", `/v2/${name}/manifests/${releaseTag}`, null))).status).toBe(200);
+      expect((await fetch(createRequest("HEAD", `/v2/${name}/manifests/${sha256}`, null))).status).toBe(200);
+    } finally {
+      bindings.IMMUTABLE_TAG_PATTERN = previousPattern;
+    }
+  });
+
+  test("blob deletion cannot make an immutable release unpullable", async () => {
+    const bindings = env as Env & { IMMUTABLE_TAG_PATTERN?: string };
+    const previousPattern = bindings.IMMUTABLE_TAG_PATTERN;
+    bindings.IMMUTABLE_TAG_PATTERN = String.raw`^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$`;
+    const name = "immutable-release-blob-delete";
+    const tag = "v1.2.3";
+
+    try {
+      const manifest = getImageManifestV2(await generateManifest(name));
+      await createManifest(name, manifest, tag);
+      const layerDigest = manifest.layers[0].digest;
+
+      const response = await fetch(createRequest("DELETE", `/v2/${name}/blobs/${layerDigest}`, null));
+
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({
+        errors: [expect.objectContaining({ code: "DENIED" })],
+      });
+      expect((await fetch(createRequest("HEAD", `/v2/${name}/blobs/${layerDigest}`, null))).status).toBe(200);
+      const manifestResponse = await fetch(createRequest("GET", `/v2/${name}/manifests/${tag}`, null));
+      expect(manifestResponse.status).toBe(200);
+      await manifestResponse.arrayBuffer();
+    } finally {
+      bindings.IMMUTABLE_TAG_PATTERN = previousPattern;
+    }
+  });
+
+  test("blob deletion remains available when immutable tag policy is disabled", async () => {
+    const bindings = env as Env & { IMMUTABLE_TAG_PATTERN?: string };
+    const previousPattern = bindings.IMMUTABLE_TAG_PATTERN;
+    bindings.IMMUTABLE_TAG_PATTERN = undefined;
+    const name = "mutable-blob-delete";
+
+    try {
+      const manifest = getImageManifestV2(await generateManifest(name));
+      const layerDigest = manifest.layers[0].digest;
+
+      const response = await fetch(createRequest("DELETE", `/v2/${name}/blobs/${layerDigest}`, null));
+
+      expect(response.status).toBe(202);
+      expect((await fetch(createRequest("HEAD", `/v2/${name}/blobs/${layerDigest}`, null))).status).toBe(404);
+    } finally {
+      bindings.IMMUTABLE_TAG_PATTERN = previousPattern;
+    }
+  });
+
+  test("invalid immutable tag policy fails before any manifest object is stored", async () => {
+    const bindings = env as Env & { IMMUTABLE_TAG_PATTERN?: string };
+    const previousPattern = bindings.IMMUTABLE_TAG_PATTERN;
+    bindings.IMMUTABLE_TAG_PATTERN = "[";
+    const name = "invalid-immutable-policy";
+    const tag = "v1.2.3";
+
+    try {
+      const manifest = await generateManifest(name);
+      const manifestData = JSON.stringify(manifest);
+      const digest = await getSHA256(manifestData);
+      const response = await fetch(
+        createRequest("PUT", `/v2/${name}/manifests/${tag}`, new Blob([manifestData]).stream(), {
+          "Content-Type": "application/gzip",
+        }),
+      );
+
+      expect(response.status).toBe(500);
+      expect(await bindings.REGISTRY.head(`${name}/manifests/${tag}`)).toBeNull();
+      expect(await bindings.REGISTRY.head(`${name}/manifests/${digest}`)).toBeNull();
+    } finally {
+      bindings.IMMUTABLE_TAG_PATTERN = previousPattern;
+    }
+  });
+
+  test("manifest PUT by digest rejects bytes whose computed digest does not match the URL", async () => {
+    const bindings = env as Env;
+    const name = "manifest-digest-mismatch";
+    const manifest = await generateManifest(name);
+    const manifestData = JSON.stringify(manifest);
+    const computedDigest = await getSHA256(manifestData);
+    const differentManifest = await generateManifest(name);
+    const requestedDigest = await getSHA256(JSON.stringify(differentManifest));
+
+    const response = await fetch(
+      createRequest("PUT", `/v2/${name}/manifests/${requestedDigest}`, new Blob([manifestData]).stream(), {
+        "Content-Type": "application/gzip",
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      errors: [expect.objectContaining({ code: "DIGEST_INVALID" })],
+    });
+    expect(await bindings.REGISTRY.head(`${name}/manifests/${requestedDigest}`)).toBeNull();
+    expect(await bindings.REGISTRY.head(`${name}/manifests/${computedDigest}`)).toBeNull();
+  });
+
+  test("manifest PUT by its computed digest remains valid", async () => {
+    const name = "manifest-digest-match";
+    const manifest = await generateManifest(name);
+    const manifestData = JSON.stringify(manifest);
+    const digest = await getSHA256(manifestData);
+
+    const response = await fetch(
+      createRequest("PUT", `/v2/${name}/manifests/${digest}`, new Blob([manifestData]).stream(), {
+        "Content-Type": "application/gzip",
+      }),
+    );
+
+    expect(response.status).toBe(201);
+    expect(response.headers.get("docker-content-digest")).toBe(digest);
+    expect((await fetch(createRequest("HEAD", `/v2/${name}/manifests/${digest}`, null))).status).toBe(200);
   });
 
   test("PUT then DELETE /v2/:name/manifests/:reference works", async () => {
@@ -474,12 +818,112 @@ describe("v2 manifests", () => {
         expect(layerC.ok).toBeTruthy();
         expect(await layerB.bytes()).toEqual(sourceData);
         expect(await layerC.bytes()).toEqual(sourceData);
+
+        // Check layer HEAD returns source metadata for mounted symlinks.
+        const layerHeadB = await fetch(createRequest("HEAD", `/v2/${repoB}/blobs/${layer}`, null));
+        expect(layerHeadB.ok).toBeTruthy();
+        expect(layerHeadB.headers.get("Docker-Content-Digest")).toEqual(layer);
+        expect(+(layerHeadB.headers.get("Content-Length") ?? "-1")).toEqual(sourceData.byteLength);
+
+        const layerHeadC = await fetch(createRequest("HEAD", `/v2/${repoC}/blobs/${layer}`, null));
+        expect(layerHeadC.ok).toBeTruthy();
+        expect(layerHeadC.headers.get("Docker-Content-Digest")).toEqual(layer);
+        expect(+(layerHeadC.headers.get("Content-Length") ?? "-1")).toEqual(sourceData.byteLength);
       }
     }
   });
 });
 
 describe("v2 referrers", () => {
+  test("immutable tag conflict does not index the rejected referrer", async () => {
+    const bindings = env as Env;
+    const previousPattern = bindings.IMMUTABLE_TAG_PATTERN;
+    bindings.IMMUTABLE_TAG_PATTERN = String.raw`^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$`;
+    const name = "immutable-referrer-conflict";
+    const tag = "v1.2.3";
+
+    try {
+      const subjectManifest = getImageManifestV2(await generateManifest(name));
+      const { sha256: subjectDigest } = await createManifest(name, subjectManifest, "latest");
+      const subject = {
+        mediaType: subjectManifest.mediaType,
+        digest: subjectDigest,
+        size: manifestSize(subjectManifest),
+      };
+      const acceptedArtifact = {
+        ...getImageManifestV2(await generateManifest(name)),
+        subject,
+        annotations: { "org.opencontainers.image.title": "accepted" },
+      } satisfies ManifestSchema;
+      const rejectedArtifact = {
+        ...getImageManifestV2(await generateManifest(name)),
+        subject,
+        annotations: { "org.opencontainers.image.title": "rejected" },
+      } satisfies ManifestSchema;
+      const { sha256: acceptedDigest } = await createManifest(name, acceptedArtifact, tag);
+      const rejectedData = JSON.stringify(rejectedArtifact);
+      const rejectedDigest = await getSHA256(rejectedData);
+
+      const response = await fetch(
+        createRequest("PUT", `/v2/${name}/manifests/${tag}`, new Blob([rejectedData]).stream(), {
+          "Content-Type": "application/gzip",
+        }),
+      );
+
+      expect(response.status).toBe(409);
+      const referrers = await getReferrersIndex(name, subjectDigest);
+      expect(referrers.body.manifests.map((descriptor) => descriptor.digest)).toEqual([acceptedDigest]);
+      expect(await bindings.REGISTRY.head(`${name}/_referrers/${subjectDigest}/${rejectedDigest}`)).toBeNull();
+    } finally {
+      bindings.IMMUTABLE_TAG_PATTERN = previousPattern;
+    }
+  });
+
+  test("PUT with subject and an inferred mediaType still indexes referrers", async () => {
+    const name = "referrers-inferred-mediatype";
+    const bindings = env as Env;
+    const subjectManifest = getImageManifestV2(await generateManifest(name));
+    const { sha256: subjectDigest } = await createManifest(name, subjectManifest, "latest");
+
+    const artifactManifest = {
+      ...getImageManifestV2(await generateManifest(name)),
+      subject: {
+        mediaType: subjectManifest.mediaType,
+        digest: subjectDigest,
+        size: manifestSize(subjectManifest),
+      },
+    } satisfies ManifestSchema;
+    const withoutMediaType: Record<string, unknown> = { ...artifactManifest };
+    delete withoutMediaType.mediaType;
+
+    const data = JSON.stringify(withoutMediaType);
+    const artifactDigest = await getSHA256(data);
+    const response = await fetch(
+      createRequest("PUT", `/v2/${name}/manifests/${artifactDigest}`, new Blob([data]).stream(), {
+        "Content-Type": "application/vnd.oci.image.manifest.v1+json",
+      }),
+    );
+
+    expect(response.ok).toBeTruthy();
+    expect(response.headers.get("oci-subject")).toEqual(subjectDigest);
+
+    // Without substituting the inferred mediaType into the parsed manifest, this descriptor is
+    // written with mediaType undefined and every later read of it is silently dropped.
+    const expectedDescriptor = {
+      mediaType: "application/vnd.oci.image.manifest.v1+json",
+      digest: artifactDigest,
+      size: new Blob([data]).size,
+      // no explicit artifactType, so it falls back to the config mediaType
+      artifactType: artifactManifest.config.mediaType,
+    };
+    const descriptorObject = await bindings.REGISTRY.get(`${name}/_referrers/${subjectDigest}/${artifactDigest}`);
+    expect(descriptorObject).not.toBeNull();
+    expect(await descriptorObject?.json()).toEqual(expectedDescriptor);
+
+    const referrers = await getReferrersIndex(name, subjectDigest);
+    expect(referrers.body.manifests).toEqual([expectedDescriptor]);
+  });
+
   test("PUT with subject indexes referrers and paginates results", async () => {
     const name = "referrers-index";
     const bindings = env as Env;
@@ -1102,7 +1546,7 @@ describe("v2 referrers", () => {
     expect(response.status).toEqual(400);
   });
 
-  test("PUT /v2/:name/manifests/:reference rejects missing local subjects", async () => {
+  test("PUT /v2/:name/manifests/:reference accepts referrers pushed before their subject", async () => {
     const name = "referrers-missing-subject";
     const bindings = env as Env;
     const missingSubjectDigest = numberedDigest(4500);
@@ -1123,13 +1567,41 @@ describe("v2 referrers", () => {
       }),
     );
 
-    expect(response.status).toEqual(400);
-    expect((await response.json()) as { errors: { code: string; message: string }[] }).toEqual({
-      errors: [expect.objectContaining({ code: "BLOB_UNKNOWN", message: `unknown subject ${missingSubjectDigest}` })],
-    });
-    expect(await bindings.REGISTRY.head(`${name}/manifests/artifact`)).toBeNull();
-    expect(await bindings.REGISTRY.head(`${name}/manifests/${artifactDigest}`)).toBeNull();
-    expect(await bindings.REGISTRY.head(`${name}/_referrers/${missingSubjectDigest}/${artifactDigest}`)).toBeNull();
+    expect(response.status).toEqual(201);
+    expect(response.headers.get("OCI-Subject")).toEqual(missingSubjectDigest);
+    expect(await bindings.REGISTRY.head(`${name}/manifests/artifact`)).not.toBeNull();
+    expect(await bindings.REGISTRY.head(`${name}/manifests/${artifactDigest}`)).not.toBeNull();
+    expect(await bindings.REGISTRY.head(`${name}/_referrers/${missingSubjectDigest}/${artifactDigest}`)).not.toBeNull();
+
+    const referrers = await getReferrersIndex(name, missingSubjectDigest);
+    expect(referrers.body.manifests.map((m) => m.digest)).toEqual([artifactDigest]);
+  });
+
+  test("a referrer pushed before its subject remains discoverable after the subject arrives", async () => {
+    const name = "referrers-before-subject";
+    const subjectManifest = getImageManifestV2(await generateManifest(name));
+    const subjectData = JSON.stringify(subjectManifest);
+    const subjectDigest = await getSHA256(subjectData);
+    const artifactManifest = {
+      ...getImageManifestV2(await generateManifest(name)),
+      artifactType: "application/vnd.cloudchamber.btrfs-chain.v1",
+      subject: {
+        mediaType: subjectManifest.mediaType,
+        digest: subjectDigest,
+        size: manifestSize(subjectManifest),
+      },
+    } satisfies ManifestSchema;
+    const { sha256: artifactDigest } = await createManifest(name, artifactManifest, "artifact");
+
+    const subjectResponse = await fetch(
+      createRequest("PUT", `/v2/${name}/manifests/${subjectDigest}`, new Blob([subjectData]).stream(), {
+        "Content-Type": subjectManifest.mediaType,
+      }),
+    );
+
+    expect(subjectResponse.status).toEqual(201);
+    const referrers = await getReferrersIndex(name, subjectDigest);
+    expect(referrers.body.manifests.map((descriptor) => descriptor.digest)).toContain(artifactDigest);
   });
 
   test("PUT /v2/:name/manifests/:reference rejects invalid subject-bearing OCI indexes", async () => {
@@ -1710,6 +2182,49 @@ describe("http client", () => {
     );
   });
 
+  test("test get layer forwards a suffix range and surfaces the partial content", async () => {
+    const name = "http-client-suffix-range";
+    const digest = numberedDigest(9950);
+    const body = "abcdefghij";
+
+    envBindings = { ...bindings };
+    envBindings.JWT_REGISTRY_TOKENS_PUBLIC_KEY = "";
+    envBindings.PASSWORD = "world";
+    envBindings.USERNAME = "hello";
+    envBindings.REGISTRIES_JSON = undefined;
+    const blobRequests: { path: string; range: string | null }[] = [];
+    using _fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const request = new Request(input as string | URL | Request, init);
+      const url = new URL(request.url);
+      if (url.pathname === "/v2/" || url.pathname === "/v2") {
+        return new Response(null, { status: 200 });
+      }
+
+      blobRequests.push({ path: url.pathname, range: request.headers.get("Range") });
+      return new Response(body.slice(-4), {
+        status: 206,
+        headers: { "Content-Range": `bytes 6-9/${body.length}` },
+      });
+    });
+
+    const client = new RegistryHTTPClient(envBindings, {
+      registry: "https://localhost",
+      password_env: "PASSWORD",
+      username,
+    });
+
+    const res = await client.getLayer(name, digest, { suffix: 4 });
+    if ("response" in res) {
+      expect(await res.response.json()).toEqual({ status: res.response.status });
+      throw new Error("expected getLayer to return partial content");
+    }
+
+    expect(blobRequests).toEqual([{ path: `/v2/${name}/blobs/${digest}`, range: "bytes=-4" }]);
+    expect(res.contentRange).toEqual({ start: 6, end: 9, size: body.length });
+    expect(res.size).toEqual(body.length);
+    expect(await new Response(res.stream).text()).toEqual(body.slice(-4));
+  });
+
   test("test list referrers selects rel next from multi-link headers", async () => {
     const name = "http-client-referrers-multilink";
     const subjectDigest = numberedDigest(9970);
@@ -2252,6 +2767,40 @@ describe("v2 manifest-list", () => {
       expect(await layerLinked.text()).toEqual(await layerSource.text());
     }
   });
+
+  test("sparse indexes can be pushed when only some platforms are mirrored", async () => {
+    const name = "sparse-index";
+    const amd = await generateManifest(name);
+    const { sha256: amdDigest } = await createManifest(name, amd);
+    const missing = `sha256:${"f".repeat(64)}`;
+    const index = {
+      schemaVersion: 2,
+      mediaType: "application/vnd.oci.image.index.v1+json",
+      manifests: [
+        {
+          mediaType: "application/vnd.oci.image.manifest.v1+json",
+          digest: amdDigest,
+          size: JSON.stringify(amd).length,
+          platform: { os: "linux", architecture: "amd64" },
+        },
+        {
+          mediaType: "application/vnd.oci.image.manifest.v1+json",
+          digest: missing,
+          size: 123,
+          platform: { os: "windows", architecture: "amd64" },
+        },
+      ],
+    };
+    const put = await fetch(
+      createRequest("PUT", `/v2/${name}/manifests/latest`, new Blob([JSON.stringify(index)]).stream(), {
+        "Content-Type": "application/vnd.oci.image.index.v1+json",
+      }),
+    );
+    expect(put.status).toBe(201);
+    expect(put.headers.get("docker-content-digest")).toBe(await getSHA256(JSON.stringify(index)));
+    expect((await fetch(createRequest("GET", `/v2/${name}/manifests/${amdDigest}`, null))).status).toBe(200);
+    expect((await fetch(createRequest("GET", `/v2/${name}/manifests/${missing}`, null))).status).toBe(404);
+  });
 });
 
 async function runGarbageCollector(name: string, mode: "unreferenced" | "untagged" | "both"): Promise<void> {
@@ -2510,6 +3059,290 @@ describe("garbage collector", () => {
   });
 });
 
+describe("anonymous pulls", () => {
+  async function anonFetch(method: string, path: string, repositories: string | undefined, headers = {}) {
+    const ctx = createExecutionContext();
+    const res = (await worker.fetch(
+      createRequest(method, path, null, headers),
+      { ...env, ANONYMOUS_PULL_REPOSITORIES: repositories } as Env,
+      ctx,
+    )) as Response;
+    await waitOnExecutionContext(ctx);
+    return res;
+  }
+
+  test("patterns", () => {
+    const e = (v: string) => ({ ANONYMOUS_PULL_REPOSITORIES: v }) as Env;
+    expect(anonymousPullPatterns(e("")).length).toBe(0);
+    expect(anonymousPullPatterns(e(" a/b, c/*  d ")).map((r) => r.source)).toEqual(["^a\\/b$", "^c\\/.*$", "^d$"]);
+    const r = (path: string, method = "GET") =>
+      anonymousPullRepository(e("org/*,single"), new Request(`https://registry.com${path}`, { method }));
+    const digest = `sha256:${"a".repeat(64)}`;
+    expect(r("/v2/org/app/manifests/latest")).toBe("org/app");
+    expect(r("/v2/org/deep/app/manifests/latest", "HEAD")).toBe("org/deep/app");
+    expect(r(`/v2/org/app/blobs/${digest}`)).toBe("org/app");
+    expect(r("/v2/org/app/tags/list")).toBe("org/app");
+    expect(r(`/v2/org/app/referrers/${digest}`)).toBe("org/app");
+    expect(r("/v2/single/manifests/1")).toBe("single");
+    expect(r("/v2/single2/manifests/1")).toBeNull();
+    expect(r("/v2/other/app/manifests/latest")).toBeNull();
+    expect(r("/v2/org/app/manifests/latest", "PUT")).toBeNull();
+    expect(r("/v2/org/app/blobs/uploads/some-uuid")).toBeNull();
+    expect(r("/v2/org/app/blobs/uploads")).toBeNull();
+    expect(r("/v2/")).toBeNull();
+    expect(r("/v2/_catalog")).toBeNull();
+  });
+
+  test("allowed repositories can be pulled without credentials", async () => {
+    const manifest = await generateManifest("public/app");
+    const { sha256 } = await createManifest("public/app", manifest, "latest");
+    const layer = getLayersFromManifest(manifest)[1];
+
+    expect((await anonFetch("GET", "/v2/public/app/manifests/latest", "public/*")).status).toBe(200);
+    expect((await anonFetch("HEAD", `/v2/public/app/manifests/${sha256}`, "public/*")).status).toBe(200);
+    const blob = await anonFetch("GET", `/v2/public/app/blobs/${layer}`, "public/*");
+    expect(blob.status).toBe(200);
+    expect(blob.headers.get("docker-content-digest")).toBe(layer);
+    expect((await anonFetch("HEAD", `/v2/public/app/blobs/${layer}`, "public/*")).status).toBe(200);
+    expect((await anonFetch("GET", "/v2/public/app/tags/list", "public/*")).status).toBe(200);
+    // unknown objects in allowed repositories are a normal 404, not an auth error
+    expect((await anonFetch("GET", "/v2/public/app/manifests/missing", "public/*")).status).toBe(404);
+  });
+
+  test("everything else still needs credentials", async () => {
+    await createManifest("private/app", await generateManifest("private/app"), "latest");
+    await createManifest("public/app", await generateManifest("public/app"), "latest");
+
+    // feature off
+    expect((await anonFetch("GET", "/v2/public/app/manifests/latest", undefined)).status).toBe(401);
+    expect((await anonFetch("GET", "/v2/public/app/manifests/latest", "")).status).toBe(401);
+    // other repository
+    expect((await anonFetch("GET", "/v2/private/app/manifests/latest", "public/*")).status).toBe(401);
+    // the ping keeps its Basic challenge so docker still sends credentials for pushes
+    const ping = await anonFetch("GET", "/v2/", "*");
+    expect(ping.status).toBe(401);
+    expect(ping.headers.get("WWW-Authenticate")).toContain("Basic");
+    expect((await anonFetch("GET", "/v2/_catalog", "*")).status).toBe(401);
+    // writes
+    expect((await anonFetch("POST", "/v2/public/app/blobs/uploads/", "*")).status).toBe(401);
+    expect((await anonFetch("PUT", "/v2/public/app/manifests/latest", "*")).status).toBe(401);
+    expect((await anonFetch("DELETE", "/v2/public/app/manifests/latest", "*")).status).toBe(401);
+    expect((await anonFetch("POST", "/v2/public/app/gc", "*")).status).toBe(401);
+    // wrong credentials are rejected even for public repositories
+    expect(
+      (
+        await anonFetch("GET", "/v2/public/app/manifests/latest", "*", {
+          Authorization: usernamePasswordToAuth("hello", "wrong"),
+        })
+      ).status,
+    ).toBe(401);
+  });
+
+  test("anonymous requests never use the pull fallback", () => {
+    const withFallback = { ...env, REGISTRIES_JSON: '[{ "registry": "https://ghcr.io" }]' } as Env;
+    expect(registries(withFallback).length).toBe(1);
+    expect(registries({ ...withFallback, ANONYMOUS_REQUEST: true }).length).toBe(0);
+  });
+
+  test("requests do not modify the shared env", async () => {
+    const shared = { ...env, ANONYMOUS_PULL_REPOSITORIES: "*" } as Env;
+    const ctx = createExecutionContext();
+    await worker.fetch(createRequest("GET", "/v2/public/app/tags/list", null), shared, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(shared.REGISTRY_CLIENT).toBeUndefined();
+    expect(shared.ANONYMOUS_REQUEST).toBeUndefined();
+  });
+});
+
+describe("blob range requests", () => {
+  async function uploadBlob(name: string, data: string): Promise<string> {
+    const sha256 = await getSHA256(data);
+    const res = await fetch(createRequest("POST", `/v2/${name}/blobs/uploads/`, null, {}));
+    expect(res.ok).toBeTruthy();
+    const stream = limit(new Blob([data]).stream(), data.length);
+    const res2 = await fetch(createRequest("PATCH", res.headers.get("location")!, stream, {}));
+    expect(res2.ok).toBeTruthy();
+    const last = await fetch(createRequest("PUT", res2.headers.get("location")! + "&digest=" + sha256, null, {}));
+    expect(last.ok).toBeTruthy();
+    return sha256;
+  }
+
+  const data = "0123456789abcdefghijklmnopqrstuvwxyz";
+
+  test("open-ended Range returns 206 partial content from the offset", async () => {
+    const name = "range-open";
+    const digest = await uploadBlob(name, data);
+
+    const res = await fetch(createRequest("GET", `/v2/${name}/blobs/${digest}`, null, { Range: "bytes=10-" }));
+    expect(res.status).toEqual(206);
+    expect(res.headers.get("content-range")).toEqual(`bytes 10-${data.length - 1}/${data.length}`);
+    expect(res.headers.get("content-length")).toEqual(`${data.length - 10}`);
+    expect(res.headers.get("accept-ranges")).toEqual("bytes");
+    expect(await res.text()).toEqual(data.slice(10));
+  });
+
+  test("bounded Range returns 206 partial content for the requested window", async () => {
+    const name = "range-bounded";
+    const digest = await uploadBlob(name, data);
+
+    const res = await fetch(createRequest("GET", `/v2/${name}/blobs/${digest}`, null, { Range: "bytes=5-14" }));
+    expect(res.status).toEqual(206);
+    expect(res.headers.get("content-range")).toEqual(`bytes 5-14/${data.length}`);
+    expect(res.headers.get("content-length")).toEqual("10");
+    expect(await res.text()).toEqual(data.slice(5, 15));
+  });
+
+  test("no Range header keeps the existing full 200 behavior", async () => {
+    const name = "range-none";
+    const digest = await uploadBlob(name, data);
+
+    const res = await fetch(createRequest("GET", `/v2/${name}/blobs/${digest}`, null));
+    expect(res.status).toEqual(200);
+    expect(res.headers.get("content-length")).toEqual(`${data.length}`);
+    expect(res.headers.get("content-range")).toBeNull();
+    expect(await res.text()).toEqual(data);
+  });
+
+  test("out-of-bounds Range returns 416 Range Not Satisfiable", async () => {
+    const name = "range-oob";
+    const digest = await uploadBlob(name, data);
+
+    const res = await fetch(createRequest("GET", `/v2/${name}/blobs/${digest}`, null, { Range: "bytes=100-200" }));
+    expect(res.status).toEqual(416);
+    expect(res.headers.get("content-range")).toEqual(`bytes */${data.length}`);
+  });
+
+  test("HEAD blob response advertises Accept-Ranges", async () => {
+    const name = "range-head";
+    const digest = await uploadBlob(name, data);
+
+    const res = await fetch(createRequest("HEAD", `/v2/${name}/blobs/${digest}`, null));
+    expect(res.ok).toBeTruthy();
+    expect(res.headers.get("accept-ranges")).toEqual("bytes");
+  });
+
+  test("suffix Range returns 206 partial content with the last bytes", async () => {
+    const name = "range-suffix";
+    const digest = await uploadBlob(name, data);
+
+    const res = await fetch(createRequest("GET", `/v2/${name}/blobs/${digest}`, null, { Range: "bytes=-5" }));
+    expect(res.status).toEqual(206);
+    expect(res.headers.get("content-range")).toEqual(`bytes ${data.length - 5}-${data.length - 1}/${data.length}`);
+    expect(res.headers.get("content-length")).toEqual("5");
+    expect(await res.text()).toEqual(data.slice(-5));
+  });
+
+  test("suffix Range longer than the blob returns the whole blob as partial content", async () => {
+    const name = "range-suffix-oversized";
+    const digest = await uploadBlob(name, data);
+
+    const res = await fetch(createRequest("GET", `/v2/${name}/blobs/${digest}`, null, { Range: "bytes=-1000" }));
+    expect(res.status).toEqual(206);
+    expect(res.headers.get("content-range")).toEqual(`bytes 0-${data.length - 1}/${data.length}`);
+    expect(res.headers.get("content-length")).toEqual(`${data.length}`);
+    expect(await res.text()).toEqual(data);
+  });
+
+  test("zero-length suffix Range returns 416 Range Not Satisfiable", async () => {
+    const name = "range-suffix-zero";
+    const digest = await uploadBlob(name, data);
+
+    const res = await fetch(createRequest("GET", `/v2/${name}/blobs/${digest}`, null, { Range: "bytes=-0" }));
+    expect(res.status).toEqual(416);
+    expect(res.headers.get("content-range")).toEqual(`bytes */${data.length}`);
+  });
+
+  test("Range header without a start or a suffix length keeps the full 200 behavior", async () => {
+    const name = "range-malformed";
+    const digest = await uploadBlob(name, data);
+
+    const res = await fetch(createRequest("GET", `/v2/${name}/blobs/${digest}`, null, { Range: "bytes=-" }));
+    expect(res.status).toEqual(200);
+    expect(res.headers.get("content-range")).toBeNull();
+    expect(await res.text()).toEqual(data);
+  });
+});
+
+describe("blob range requests against fallback registries", () => {
+  const bindings = env as Env;
+  const data = "0123456789abcdefghijklmnopqrstuvwxyz";
+
+  test("an upstream 416 is reported to the client instead of a 404", async () => {
+    const name = "range-fallback-unsatisfiable";
+    const digest = await getSHA256(data);
+    const previousRegistries = bindings.REGISTRIES_JSON;
+    bindings.REGISTRIES_JSON = JSON.stringify([{ registry: "https://fallback.registry" }]);
+    const blobRequests: { path: string; range: string | null }[] = [];
+    using _fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const request = new Request(input as string | URL | Request, init);
+      const url = new URL(request.url);
+      if (url.pathname === "/v2/" || url.pathname === "/v2") {
+        return new Response(null, { status: 200 });
+      }
+
+      blobRequests.push({ path: url.pathname, range: request.headers.get("Range") });
+      // The upstream holds the blob, but the requested range doesn't fit it.
+      const response = new Response(null, {
+        status: 416,
+        headers: { "Content-Range": `bytes */${data.length}`, "Accept-Ranges": "bytes" },
+      });
+      // A constructed Response has an empty url, which the client would read as a redirect.
+      Object.defineProperty(response, "url", { value: request.url });
+      return response;
+    });
+
+    try {
+      const res = await fetch(createRequest("GET", `/v2/${name}/blobs/${digest}`, null, { Range: "bytes=100-200" }));
+      expect(blobRequests).toEqual([{ path: `/v2/${name}/blobs/${digest}`, range: "bytes=100-200" }]);
+      expect(res.status).toEqual(416);
+      expect(res.headers.get("content-range")).toEqual(`bytes */${data.length}`);
+    } finally {
+      bindings.REGISTRIES_JSON = previousRegistries;
+    }
+  });
+
+  test("a non-416 upstream failure still falls through to the next registry", async () => {
+    const name = "range-fallback-continue";
+    const digest = await getSHA256(data);
+    const previousRegistries = bindings.REGISTRIES_JSON;
+    bindings.REGISTRIES_JSON = JSON.stringify([
+      { registry: "https://broken.registry" },
+      { registry: "https://healthy.registry" },
+    ]);
+    const blobHosts: string[] = [];
+    using _fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const request = new Request(input as string | URL | Request, init);
+      const url = new URL(request.url);
+      if (url.pathname === "/v2/" || url.pathname === "/v2") {
+        return new Response(null, { status: 200 });
+      }
+
+      blobHosts.push(url.host);
+      if (url.host === "broken.registry") {
+        const failure = new Response("boom", { status: 500 });
+        // A constructed Response has an empty url, which the client would read as a redirect.
+        Object.defineProperty(failure, "url", { value: request.url });
+        return failure;
+      }
+
+      return new Response(data.slice(10), {
+        status: 206,
+        headers: { "Content-Range": `bytes 10-${data.length - 1}/${data.length}` },
+      });
+    });
+
+    try {
+      const res = await fetch(createRequest("GET", `/v2/${name}/blobs/${digest}`, null, { Range: "bytes=10-" }));
+      expect(blobHosts).toEqual(["broken.registry", "healthy.registry"]);
+      expect(res.status).toEqual(206);
+      expect(res.headers.get("content-range")).toEqual(`bytes 10-${data.length - 1}/${data.length}`);
+      expect(await res.text()).toEqual(data.slice(10));
+    } finally {
+      bindings.REGISTRIES_JSON = previousRegistries;
+    }
+  });
+});
+
 test("docker.io", () => {
   const t = [
     ["https://docker.io", true],
@@ -2527,4 +3360,387 @@ test("docker.io", () => {
       throw new Error(`Expected ${testCase[1]} on ${testCase[0]} but got ${isDocker}`);
     }
   }
+});
+
+describe("blob and manifest GET/HEAD response headers", () => {
+  // These responses must carry a literal Content-Length (and the manifest its Content-Type), and
+  // set Content-Encoding: identity so the runtime does not switch to chunked transfer-encoding and
+  // drop Content-Length — the regression these tests guard.
+  test("blob GET and HEAD return Content-Length, Content-Encoding identity, and the exact bytes", async () => {
+    const name = "headers/blob";
+    const data = "blob-bytes-for-content-length";
+    const sha256 = await getSHA256(data);
+    const post = await fetch(createRequest("POST", `/v2/${name}/blobs/uploads/`, null, {}));
+    const patch = await fetch(
+      createRequest("PATCH", post.headers.get("location")!, limit(new Blob([data]).stream(), data.length), {}),
+    );
+    await fetch(createRequest("PUT", patch.headers.get("location")! + "&digest=" + sha256, null, {}));
+
+    const get = await fetch(createRequest("GET", `/v2/${name}/blobs/${sha256}`, null));
+    expect(get.status).toBe(200);
+    expect(get.headers.get("Content-Length")).toEqual(`${data.length}`);
+    expect(get.headers.get("Content-Encoding")).toEqual("identity");
+    expect(await get.text()).toEqual(data);
+
+    const head = await fetch(createRequest("HEAD", `/v2/${name}/blobs/${sha256}`, null));
+    expect(head.status).toBe(200);
+    expect(head.headers.get("Content-Length")).toEqual(`${data.length}`);
+    expect(head.headers.get("Content-Encoding")).toEqual("identity");
+  });
+
+  test("manifest GET and HEAD return Content-Length, Content-Type and Content-Encoding identity", async () => {
+    const name = "headers/manifest";
+    const manifest = await generateManifest(name);
+    const { sha256 } = await createManifest(name, manifest, "v1");
+    const size = new Blob([JSON.stringify(manifest)]).size;
+
+    // Manifests are stored (uploadManifest) with this content type; GET/HEAD must echo it exactly.
+    const get = await fetch(createRequest("GET", `/v2/${name}/manifests/v1`, null));
+    expect(get.status).toBe(200);
+    expect(get.headers.get("Content-Length")).toEqual(`${size}`);
+    expect(get.headers.get("Content-Type")).toEqual("application/gzip");
+    expect(get.headers.get("Content-Encoding")).toEqual("identity");
+
+    const head = await fetch(createRequest("HEAD", `/v2/${name}/manifests/${sha256}`, null));
+    expect(head.status).toBe(200);
+    expect(head.headers.get("Content-Length")).toEqual(`${size}`);
+    expect(head.headers.get("Content-Type")).toEqual("application/gzip");
+    expect(head.headers.get("Content-Encoding")).toEqual("identity");
+  });
+});
+
+describe("manifest PUT digest validation", () => {
+  test("PUT manifest by a mismatched digest is rejected 400 DIGEST_INVALID (not stored)", async () => {
+    const name = "manifestdigest/mismatch";
+    const manifest = await generateManifest(name);
+    const data = JSON.stringify(manifest);
+    const wrongDigest = "sha256:" + "0".repeat(64);
+    const res = await fetch(
+      createRequest("PUT", `/v2/${name}/manifests/${wrongDigest}`, new Blob([data]).stream(), {
+        "Content-Type": "application/vnd.oci.image.manifest.v1+json",
+      }),
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { errors: { code: string }[] };
+    expect(body.errors[0].code).toBe("DIGEST_INVALID");
+    // Must NOT have been stored under the wrong digest key.
+    const get = await fetch(createRequest("GET", `/v2/${name}/manifests/${wrongDigest}`, null));
+    expect(get.status).toBe(404);
+  });
+
+  test("PUT manifest by a malformed digest reference is rejected 400 DIGEST_INVALID", async () => {
+    const name = "manifestdigest/malformed";
+    const manifest = await generateManifest(name);
+    const res = await fetch(
+      createRequest(
+        "PUT",
+        `/v2/${name}/manifests/sha256:baddigeststring`,
+        new Blob([JSON.stringify(manifest)]).stream(),
+        {
+          "Content-Type": "application/vnd.oci.image.manifest.v1+json",
+        },
+      ),
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { errors: { code: string }[] };
+    expect(body.errors[0].code).toBe("DIGEST_INVALID");
+  });
+
+  test("PUT manifest by its correct digest still succeeds (201)", async () => {
+    const name = "manifestdigest/correct";
+    const manifest = await generateManifest(name);
+    const data = JSON.stringify(manifest);
+    const digest = await getSHA256(data);
+    const res = await fetch(
+      createRequest("PUT", `/v2/${name}/manifests/${digest}`, new Blob([data]).stream(), {
+        "Content-Type": "application/vnd.oci.image.manifest.v1+json",
+      }),
+    );
+    expect(res.status).toBe(201);
+    expect(res.headers.get("docker-content-digest")).toEqual(digest);
+  });
+});
+
+// Multi-chunk uploads (a PATCH chunk followed by a chunk in the finalizing PUT) exercise the
+// small-chunk reconstruction path, which the registry only performs under full push-compatibility
+// mode (PUSH_COMPATIBILITY_MODE=full); these finalize tests enable that mode.
+async function fetchFullCompat(r: Request): Promise<Response> {
+  r.headers.append("Authorization", usernamePasswordToAuth(username, "world"));
+  const ctx = createExecutionContext();
+  const res = await worker.fetch(r, { ...env, PUSH_COMPATIBILITY_MODE: "full" } as Env, ctx);
+  await waitOnExecutionContext(ctx);
+  return res as Response;
+}
+
+describe("blob upload finalization error handling", () => {
+  test("PUT finalize with a wrong digest is rejected 400 DIGEST_INVALID (not 500)", async () => {
+    const name = "uploaderr/baddigest";
+    const data = "the-real-content";
+    const post = await fetch(createRequest("POST", `/v2/${name}/blobs/uploads/`, null, {}));
+    const patch = await fetch(
+      createRequest("PATCH", post.headers.get("location")!, limit(new Blob([data]).stream(), data.length), {}),
+    );
+    expect(patch.status).toBe(202);
+    const wrongDigest = "sha256:" + "0".repeat(64);
+    const put = await fetch(createRequest("PUT", patch.headers.get("location")! + "&digest=" + wrongDigest, null, {}));
+    expect(put.status).toBe(400);
+    // Assert the mapped body, which guards the coupling to R2's checksum-mismatch wording: if the
+    // runtime changes that text, putBlob would fall through to 500 and this assertion would fail.
+    const body = (await put.json()) as { errors: { code: string }[] };
+    expect(body.errors[0].code).toBe("DIGEST_INVALID");
+  });
+
+  test("PUT finalize with an out-of-order final chunk is rejected 416", async () => {
+    const name = "uploaderr/outoforder";
+    const first = "0123456789"; // 10 bytes staged at 0-9
+    const post = await fetch(createRequest("POST", `/v2/${name}/blobs/uploads/`, null, {}));
+    const patch = await fetch(
+      createRequest("PATCH", post.headers.get("location")!, limit(new Blob([first]).stream(), first.length), {
+        "Content-Range": "0-9",
+      }),
+    );
+    expect(patch.status).toBe(202);
+    // A final chunk whose range does not continue at byte 10 is out of order.
+    const finalData = "abcdefghij";
+    const digest = await getSHA256(first + finalData);
+    const put = await fetch(
+      createRequest(
+        "PUT",
+        patch.headers.get("location")! + "&digest=" + digest,
+        limit(new Blob([finalData]).stream(), finalData.length),
+        { "Content-Range": "50-59", "Content-Length": `${finalData.length}` },
+      ),
+    );
+    expect(put.status).toBe(416);
+  });
+
+  test("PUT finalize carrying the final chunk assembles the blob (201) and round-trips", async () => {
+    const name = "uploaderr/finalchunk";
+    const first = "first-part-bytes";
+    const finalData = "final-chunk-bytes";
+    const full = first + finalData;
+    const digest = await getSHA256(full);
+    const post = await fetchFullCompat(createRequest("POST", `/v2/${name}/blobs/uploads/`, null, {}));
+    const patch = await fetchFullCompat(
+      createRequest("PATCH", post.headers.get("location")!, limit(new Blob([first]).stream(), first.length), {
+        "Content-Range": `0-${first.length - 1}`,
+      }),
+    );
+    expect(patch.status).toBe(202);
+    const put = await fetchFullCompat(
+      createRequest(
+        "PUT",
+        patch.headers.get("location")! + "&digest=" + digest,
+        limit(new Blob([finalData]).stream(), finalData.length),
+        { "Content-Range": `${first.length}-${full.length - 1}`, "Content-Length": `${finalData.length}` },
+      ),
+    );
+    expect(put.status).toBe(201);
+    // The PUT-carried final chunk must actually be stored (previously it was silently dropped).
+    const get = await fetchFullCompat(createRequest("GET", `/v2/${name}/blobs/${digest}`, null));
+    expect(get.status).toBe(200);
+    expect(await get.text()).toEqual(full);
+  });
+
+  test("PUT finalize of an empty (zero-byte) blob succeeds 201", async () => {
+    const name = "uploaderr/empty";
+    const emptyDigest = await getSHA256("");
+    const post = await fetch(createRequest("POST", `/v2/${name}/blobs/uploads/`, null, {}));
+    const put = await fetch(createRequest("PUT", post.headers.get("location")! + "&digest=" + emptyDigest, null, {}));
+    expect(put.status).toBe(201);
+    const get = await fetch(createRequest("GET", `/v2/${name}/blobs/${emptyDigest}`, null));
+    expect(get.status).toBe(200);
+    expect(await get.text()).toEqual("");
+  });
+});
+
+describe("mounted blob HEAD reports source metadata", () => {
+  test("HEAD of a cross-repo mounted blob returns the source digest and size, not the symlink's", async () => {
+    const src = "mountsrc/repo";
+    const dst = "mountdst/repo";
+    const data = "cross-repo-mounted-layer-bytes";
+    const digest = await getSHA256(data);
+
+    // Push the blob into the source repo.
+    const post = await fetch(createRequest("POST", `/v2/${src}/blobs/uploads/`, null, {}));
+    const patch = await fetch(
+      createRequest("PATCH", post.headers.get("location")!, limit(new Blob([data]).stream(), data.length), {}),
+    );
+    const put = await fetch(createRequest("PUT", patch.headers.get("location")! + "&digest=" + digest, null, {}));
+    expect(put.ok).toBeTruthy();
+
+    // Cross-repo mount into the destination repo (stored as a symlink object).
+    const mount = await fetch(createRequest("POST", `/v2/${dst}/blobs/uploads/?from=${src}&mount=${digest}`, null, {}));
+    expect(mount.status).toBe(201);
+    expect(mount.headers.get("docker-content-digest")).toEqual(digest);
+
+    // HEAD the mounted blob: must report the source blob's size + digest, not the symlink object's.
+    const head = await fetch(createRequest("HEAD", `/v2/${dst}/blobs/${digest}`, null));
+    expect(head.status).toBe(200);
+    expect(head.headers.get("Content-Length")).toEqual(`${data.length}`);
+    expect(head.headers.get("Docker-Content-Digest")).toEqual(digest);
+  });
+});
+
+describe("content-addressed writes", () => {
+  // Simulates a bucket with retention rules on its content prefixes (blobs, manifests by digest and
+  // referrer entries): such objects can be created, but never overwritten or deleted.
+  function retainedBucket(bucket: R2Bucket): R2Bucket {
+    const retained = (key: string) => /\/(blobs\/|manifests\/sha256:|_referrers\/)/.test(key);
+    return new Proxy(bucket, {
+      get(target, prop) {
+        if (prop === "put") {
+          return async (key: string, value: ReadableStream | string | null, options?: R2PutOptions) => {
+            if (retained(key) && (await target.head(key)) !== null) {
+              throw new Error(`put: object ${key} is retained and cannot be overwritten`);
+            }
+            return target.put(key, value, options);
+          };
+        }
+        if (prop === "delete") {
+          return async (keys: string | string[]) => {
+            for (const key of Array.isArray(keys) ? keys : [keys]) {
+              if (retained(key)) throw new Error(`delete: object ${key} is retained`);
+            }
+            return target.delete(keys);
+          };
+        }
+        const value = Reflect.get(target, prop);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  }
+
+  async function fetchRetained(r: Request): Promise<Response> {
+    r.headers.append("Authorization", usernamePasswordToAuth(username, "world"));
+    const bindings = env as Env;
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(r, { ...bindings, REGISTRY: retainedBucket(bindings.REGISTRY) } as Env, ctx);
+    await waitOnExecutionContext(ctx);
+    return res as Response;
+  }
+
+  async function pushBlob(f: (r: Request) => Promise<Response>, name: string, data: string, digest: string) {
+    const post = await f(createRequest("POST", `/v2/${name}/blobs/uploads/`, null, {}));
+    expect(post.status).toEqual(202);
+    const put = await f(
+      createRequest("PUT", `${post.headers.get("location")!}&digest=${digest}`, new Blob([data]).stream(), {
+        "Content-Length": `${data.length}`,
+      }),
+    );
+    expect(put.status).toEqual(201);
+  }
+
+  test("re-pushing existing content does not rewrite it", async () => {
+    const name = "content-addressed/repush";
+    const bindings = env as Env;
+    const manifest = await generateManifest(name);
+    const { sha256 } = await createManifest(name, manifest, "v1");
+    const layer = getLayersFromManifest(manifest)[1];
+    const manifestBefore = (await bindings.REGISTRY.head(`${name}/manifests/${sha256}`))!;
+    const layerBefore = (await bindings.REGISTRY.head(`${name}/blobs/${layer}`))!;
+
+    const layerData = await (await bindings.REGISTRY.get(`${name}/blobs/${layer}`))!.text();
+    await pushBlob(fetch, name, layerData, layer);
+    await createManifest(name, manifest, "v2");
+
+    expect((await bindings.REGISTRY.head(`${name}/manifests/${sha256}`))!.version).toEqual(manifestBefore.version);
+    expect((await bindings.REGISTRY.head(`${name}/blobs/${layer}`))!.version).toEqual(layerBefore.version);
+    const tags = (await (await fetch(createRequest("GET", `/v2/${name}/tags/list`, null))).json()) as TagsList;
+    expect(tags.tags).toEqual(["v1", "v2"]);
+  });
+
+  test("pushes of existing content succeed when the content keys cannot be overwritten", async () => {
+    const name = "content-addressed/retained";
+    const mounted = "content-addressed/retained-mount";
+    const bindings = env as Env;
+    const manifest = await generateManifest(name);
+    const data = JSON.stringify(manifest);
+    const { sha256 } = await createManifest(name, manifest, "v1");
+    const layer = getLayersFromManifest(manifest)[1];
+    const layerData = await (await bindings.REGISTRY.get(`${name}/blobs/${layer}`))!.text();
+    const artifact = {
+      ...getImageManifestV2(await generateManifest(name)),
+      artifactType: "application/vnd.example.signature.v1",
+      subject: { mediaType: "application/vnd.oci.image.manifest.v1+json", digest: sha256, size: data.length },
+    } satisfies ManifestSchema;
+    const artifactData = JSON.stringify(artifact);
+    const artifactDigest = await getSHA256(artifactData);
+    await createManifest(name, artifact);
+    expect(await mountLayersFromManifest(name, manifest, mounted)).toBeGreaterThan(0);
+
+    // Push everything a second time through a bucket that refuses overwrites of content keys
+    await pushBlob(fetchRetained, name, layerData, layer);
+    for (const reference of [sha256, "v1", "v2"]) {
+      const res = await fetchRetained(
+        createRequest("PUT", `/v2/${name}/manifests/${reference}`, new Blob([data]).stream(), {
+          "Content-Type": "application/gzip",
+        }),
+      );
+      expect(res.status).toEqual(201);
+      expect(res.headers.get("docker-content-digest")).toEqual(sha256);
+    }
+    const referrer = await fetchRetained(
+      createRequest("PUT", `/v2/${name}/manifests/${artifactDigest}`, new Blob([artifactData]).stream(), {
+        "Content-Type": "application/gzip",
+      }),
+    );
+    expect(referrer.status).toEqual(201);
+    for (const digest of getLayersFromManifest(manifest)) {
+      const mount = await fetchRetained(
+        createRequest("POST", `/v2/${mounted}/blobs/uploads/?from=${name}&mount=${digest}`, null, {}),
+      );
+      expect(mount.status).toEqual(201);
+    }
+
+    const layerGet = await fetch(createRequest("GET", `/v2/${mounted}/blobs/${layer}`, null));
+    expect(await layerGet.text()).toEqual(layerData);
+    const referrers = await getReferrersIndex(name, sha256);
+    expect(referrers.body.manifests.map((m) => m.digest)).toEqual([artifactDigest]);
+    const tags = (await (await fetch(createRequest("GET", `/v2/${name}/tags/list`, null))).json()) as TagsList;
+    expect(tags.tags).toEqual(["v1", "v2"]);
+  });
+});
+
+describe("DISABLE_DELETE", () => {
+  async function fetchNoDelete(r: Request, value = "true"): Promise<Response> {
+    r.headers.append("Authorization", usernamePasswordToAuth(username, "world"));
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(r, { ...env, DISABLE_DELETE: value } as Env, ctx);
+    await waitOnExecutionContext(ctx);
+    return res as Response;
+  }
+
+  test("refuses deleting manifests, blobs and garbage collection", async () => {
+    const name = "no-delete/app";
+    const bindings = env as Env;
+    const manifest = await generateManifest(name);
+    const { sha256 } = await createManifest(name, manifest, "v1");
+    const layer = getLayersFromManifest(manifest)[1];
+
+    for (const path of [`/v2/${name}/manifests/v1`, `/v2/${name}/manifests/${sha256}`, `/v2/${name}/blobs/${layer}`]) {
+      const res = await fetchNoDelete(createRequest("DELETE", path, null));
+      expect(res.status).toEqual(405);
+      expect(((await res.json()) as { errors: { code: string }[] }).errors[0].code).toEqual("UNSUPPORTED");
+    }
+    for (const mode of ["unreferenced", "untagged"]) {
+      const res = await fetchNoDelete(createRequest("POST", `/v2/${name}/gc?mode=${mode}`, null));
+      expect(res.status).toEqual(405);
+    }
+
+    expect(await bindings.REGISTRY.head(`${name}/manifests/v1`)).not.toBeNull();
+    expect(await bindings.REGISTRY.head(`${name}/manifests/${sha256}`)).not.toBeNull();
+    expect(await bindings.REGISTRY.head(`${name}/blobs/${layer}`)).not.toBeNull();
+  });
+
+  test("leaves deletion enabled for any other value", async () => {
+    const name = "no-delete/off";
+    const { sha256 } = await createManifest(name, await generateManifest(name), "v1");
+    expect((await fetchNoDelete(createRequest("DELETE", `/v2/${name}/manifests/v1`, null), "false")).status).toEqual(
+      202,
+    );
+    expect((await fetchNoDelete(createRequest("DELETE", `/v2/${name}/manifests/${sha256}`, null), "")).status).toEqual(
+      202,
+    );
+  });
 });

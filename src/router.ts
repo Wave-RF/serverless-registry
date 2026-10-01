@@ -1,12 +1,13 @@
 import { Router } from "itty-router";
 import { BlobUnknownError, ManifestUnknownError } from "./v2-errors";
-import { InternalError, ServerError } from "./errors";
-import { errorString, jsonHeaders, wrap } from "./utils";
+import { DeletionDisabledError, ImmutableBlobError, ImmutableTagError, InternalError, ServerError } from "./errors";
+import { errorString, getStreamSize, jsonHeaders, wrap } from "./utils";
 import { hexToDigest, isValidDigest } from "./user";
 import { ManifestTagsListTooBigError } from "./v2-responses";
 import { Env } from "..";
 import { MINIMUM_CHUNK, MAXIMUM_CHUNK, MAXIMUM_CHUNK_UPLOAD_SIZE } from "./chunk";
 import {
+  BlobRangeRequest,
   CheckLayerResponse,
   CheckManifestResponse,
   FinishedUploadObject,
@@ -19,6 +20,7 @@ import {
 } from "./registry/registry";
 import { RegistryHTTPClient } from "./registry/http";
 import { ociImageIndexContentType } from "./registry/r2";
+import { isImmutableTagReference, resolveImmutableTagPattern } from "./registry/tag-policy";
 
 const maxReferrersListLimit = 1000;
 const isOpaqueReferrersCursor = (cursor: string) => cursor.startsWith("/v2/");
@@ -27,7 +29,18 @@ function formatNextLink(url: URL): string {
   return `<${url.toString()}>; rel="next"`;
 }
 
+// Stops the runtime's automatic gzip, which switches the response to chunked transfer-encoding and
+// drops the Content-Length the distribution spec requires on blob/manifest GET and HEAD. Bodies are
+// served verbatim. Spread into each such response's headers.
+const identityEncoding = { "Content-Encoding": "identity" } as const;
+
 const v2Router = Router({ base: "/v2/" });
+
+// DISABLE_DELETE turns the registry into an append-only store: manifests, blobs and garbage
+// collection can't delete anything. Overwriting a mutable tag is still allowed.
+export function deletionDisabled(env: Env): boolean {
+  return ["true", "1", "yes"].includes((env.DISABLE_DELETE ?? "").trim().toLowerCase());
+}
 
 v2Router.get("/", async (_req, _env: Env) => {
   return new Response();
@@ -73,8 +86,19 @@ v2Router.delete("/:name+/manifests/:reference", async (req, env: Env) => {
   //
   // If somehow we need to remove by paginating, we accept a last query param.
 
+  if (deletionDisabled(env)) {
+    return new DeletionDisabledError();
+  }
+
   const { last, limit } = req.query;
   const { name, reference } = req.params;
+  const immutablePattern = resolveImmutableTagPattern(env.IMMUTABLE_TAG_PATTERN);
+  if (immutablePattern !== null && isValidDigest(reference)) {
+    return new ImmutableTagError(reference, "deleted while immutable tag policy is enabled");
+  }
+  if (isImmutableTagReference(reference, immutablePattern)) {
+    return new ImmutableTagError(reference, "deleted");
+  }
   const manifest = await env.REGISTRY.head(`${name}/manifests/${reference}`);
   if (manifest === null) {
     return new Response(JSON.stringify(ManifestUnknownError(reference)), { status: 404, headers: jsonHeaders() });
@@ -101,14 +125,22 @@ v2Router.delete("/:name+/manifests/:reference", async (req, env: Env) => {
     limit: limitInt,
     cursor: last?.toString(),
   });
+  const aliasesToDelete: string[] = [];
   for (const tag of tags.objects) {
     if (!tag.checksums.sha256) {
       continue;
     }
 
     if (hexToDigest(tag.checksums.sha256) === reference && tag.key !== `${name}/manifests/${reference}`) {
-      await env.REGISTRY.delete(tag.key);
+      const tagReference = tag.key.slice(`${name}/manifests/`.length);
+      if (isImmutableTagReference(tagReference, immutablePattern)) {
+        return new ImmutableTagError(tagReference, "deleted through its manifest digest");
+      }
+      aliasesToDelete.push(tag.key);
     }
+  }
+  if (aliasesToDelete.length > 0) {
+    await env.REGISTRY.delete(aliasesToDelete);
   }
 
   const url = new URL(req.url);
@@ -148,6 +180,7 @@ v2Router.head("/:name+/manifests/:reference", async (req, env: Env) => {
         "Content-Length": res.size.toString(),
         "Content-Type": res.contentType,
         "Docker-Content-Digest": res.digest,
+        ...identityEncoding,
       },
     });
   }
@@ -207,6 +240,7 @@ v2Router.head("/:name+/manifests/:reference", async (req, env: Env) => {
       "Content-Length": checkManifestResponse.size.toString(),
       "Content-Type": checkManifestResponse.contentType,
       "Docker-Content-Digest": checkManifestResponse.digest,
+      ...identityEncoding,
     },
   });
 });
@@ -220,6 +254,7 @@ v2Router.get("/:name+/manifests/:reference", async (req, env: Env, context: Exec
         "Content-Length": res.size.toString(),
         "Content-Type": res.contentType,
         "Docker-Content-Digest": res.digest,
+        ...identityEncoding,
       },
     });
   }
@@ -270,6 +305,7 @@ v2Router.get("/:name+/manifests/:reference", async (req, env: Env, context: Exec
       "Content-Length": getManifestResponse.size.toString(),
       "Content-Type": getManifestResponse.contentType,
       "Docker-Content-Digest": getManifestResponse.digest,
+      ...identityEncoding,
     },
   });
 });
@@ -358,54 +394,105 @@ v2Router.get("/:name+/referrers/:digest", async (req, env: Env) => {
   );
 });
 
+// Parses a single HTTP byte range request of the form "bytes=<start>-", "bytes=<start>-<end>" or
+// the suffix form "bytes=-<n>", which asks for the last n bytes.
+// Multi-range and malformed values are ignored so the full object is served.
+function parseBlobRange(header: string | null): BlobRangeRequest | undefined {
+  if (header === null) return undefined;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (match === null) return undefined;
+  const [, startValue, endValue] = match;
+  if (startValue === "") {
+    // "bytes=-" has neither a start nor a suffix length, so there is nothing to satisfy.
+    if (endValue === "") return undefined;
+    const suffix = Number(endValue);
+    return Number.isInteger(suffix) ? { suffix } : undefined;
+  }
+
+  const offset = Number(startValue);
+  if (!Number.isInteger(offset)) return undefined;
+  if (endValue === "") return { offset };
+  const end = Number(endValue);
+  if (!Number.isInteger(end)) return { offset };
+  return { offset, end };
+}
+
+function blobGetResponse(layer: GetLayerResponse): Response {
+  const headers: Record<string, string> = {
+    "Docker-Content-Digest": layer.digest,
+    "Accept-Ranges": "bytes",
+    ...identityEncoding,
+  };
+  if (layer.contentRange !== undefined) {
+    const { start, end, size } = layer.contentRange;
+    headers["Content-Length"] = `${end - start + 1}`;
+    headers["Content-Range"] = `bytes ${start}-${end}/${size}`;
+    return new Response(layer.stream, { status: 206, headers });
+  }
+
+  headers["Content-Length"] = `${layer.size}`;
+  return new Response(layer.stream, { headers });
+}
+
 v2Router.get("/:name+/blobs/:digest", async (req, env: Env, context: ExecutionContext) => {
   const { name, digest } = req.params;
-  const res = await env.REGISTRY_CLIENT.getLayer(name, digest);
+  const range = parseBlobRange(req.headers.get("range"));
+  const res = await env.REGISTRY_CLIENT.getLayer(name, digest, range);
   if (!("response" in res)) {
-    return new Response(res.stream, {
-      headers: {
-        "Docker-Content-Digest": res.digest,
-        "Content-Length": `${res.size}`,
-      },
-    });
+    return blobGetResponse(res);
+  }
+
+  // A requested range that cannot be satisfied is reported directly instead of falling back to
+  // other registries.
+  if (res.response.status === 416) {
+    return res.response;
   }
 
   let layerResponse: GetLayerResponse | null = null;
   const registriesList = registries(env);
   for (const registry of registriesList) {
     const client = new RegistryHTTPClient(env, registry);
-    const response = await client.getLayer(name, digest);
+    const response = await client.getLayer(name, digest, range);
     if ("response" in response) {
+      // The blob exists upstream but the requested range doesn't fit it. Blobs are content
+      // addressed, so every registry holding this digest holds the same bytes and would answer the
+      // same way. Report it instead of letting it fall through to the 404 below, which would tell
+      // the client the blob doesn't exist and hide the object size it needs to retry.
+      if (response.response.status === 416) {
+        return response.response;
+      }
+
       continue;
     }
 
     layerResponse = response;
-    const [s1, s2] = layerResponse.stream.tee();
-    layerResponse.stream = s1;
-    context.waitUntil(
-      (async () => {
-        const [response, err] = await wrap(env.REGISTRY_CLIENT.monolithicUpload(name, digest, s2, layerResponse.size));
-        if (err) {
-          console.error("Error uploading asynchronously the layer ", digest, "into main registry");
-          return;
-        }
+    // Only cache full-object responses. A ranged/partial upstream response must never be written to
+    // R2 as if it were the complete blob, or the cached object would be corrupt.
+    if (range === undefined && layerResponse.contentRange === undefined) {
+      const fullLayer = layerResponse;
+      const [s1, s2] = fullLayer.stream.tee();
+      fullLayer.stream = s1;
+      context.waitUntil(
+        (async () => {
+          const [response, err] = await wrap(env.REGISTRY_CLIENT.monolithicUpload(name, digest, s2, fullLayer.size));
+          if (err) {
+            console.error("Error uploading asynchronously the layer ", digest, "into main registry");
+            return;
+          }
 
-        if (response === false) {
-          console.error("Layer might be too big for the registry client", layerResponse.size);
-        }
-      })(),
-    );
+          if (response === false) {
+            console.error("Layer might be too big for the registry client", fullLayer.size);
+          }
+        })(),
+      );
+    }
+
     break;
   }
 
   if (layerResponse === null) return new Response(JSON.stringify(BlobUnknownError), { status: 404 });
 
-  return new Response(layerResponse.stream, {
-    headers: {
-      "Docker-Content-Digest": layerResponse.digest,
-      "Content-Length": `${layerResponse.size}`,
-    },
-  });
+  return blobGetResponse(layerResponse);
 });
 
 v2Router.delete("/:name+/blobs/uploads/:id", async (req, env: Env) => {
@@ -507,17 +594,19 @@ v2Router.get("/:name+/blobs/uploads/:uuid", async (req, env: Env) => {
 v2Router.patch("/:name+/blobs/uploads/:uuid", async (req, env: Env) => {
   const { name, uuid } = req.params;
   const contentRange = req.headers.get("Content-Range");
-  const [start, end] = contentRange?.split("-") ?? [undefined, undefined];
+  const rangeMatch = contentRange?.match(/(?:bytes\s+)?(\d+)-(\d+)/);
+  const [start, end] = rangeMatch ? [rangeMatch[1], rangeMatch[2]] : [undefined, undefined];
 
   if (req.body == null) {
     return new Response(null, { status: 400 });
   }
 
-  let contentLengthString = req.headers.get("Content-Length");
+  let streamSize = getStreamSize(req.headers);
   let stream = req.body;
-  if (!contentLengthString) {
+  if (streamSize === undefined) {
+    // Without Content-Length or Content-Range the length is only known once the body has been read
     const blob = await req.blob();
-    contentLengthString = `${blob.size}`;
+    streamSize = blob.size;
     stream = blob.stream();
   }
 
@@ -528,7 +617,7 @@ v2Router.patch("/:name+/blobs/uploads/:uuid", async (req, env: Env) => {
       uuid,
       url.pathname + "?" + url.searchParams.toString(),
       stream,
-      +contentLengthString,
+      streamSize,
       end !== undefined && start !== undefined ? [+start, +end] : undefined,
     ),
   );
@@ -546,8 +635,7 @@ v2Router.patch("/:name+/blobs/uploads/:uuid", async (req, env: Env) => {
     status: 202,
     headers: {
       "Location": res.location,
-      // Note that the HTTP Range header byte ranges are inclusive and that will be honored, even in non-standard use cases.
-      "Range": `${res.range.join("-")}`,
+      "Range": `0-${res.range[1]}`, // Ensure correct Range format (0-N)
       "Docker-Upload-UUID": res.id,
     },
   });
@@ -558,15 +646,36 @@ v2Router.put("/:name+/blobs/uploads/:uuid", async (req, env: Env) => {
   const { digest } = req.query;
 
   const url = new URL(req.url);
+  let location = url.pathname + "?" + url.searchParams.toString();
+  const contentLength = +(req.headers.get("Content-Length") ?? "0");
+
+  // A finalizing PUT may carry the last chunk. Append it through the same path a PATCH uses, so
+  // small chunks are combined into a valid part and an out-of-order chunk is rejected with 416
+  // (instead of corrupting the assembled blob). finishUpload then completes the staged parts.
+  if (req.body && contentLength > 0) {
+    const contentRange = req.headers.get("Content-Range");
+    const [start, end] = contentRange?.split("-") ?? [undefined, undefined];
+    const [chunk, chunkErr] = await wrap<UploadObject | RegistryError, Error>(
+      env.REGISTRY_CLIENT.uploadChunk(
+        name,
+        uuid,
+        location,
+        req.body,
+        contentLength,
+        end !== undefined && start !== undefined ? [+start, +end] : undefined,
+      ),
+    );
+    if (chunkErr) {
+      return new InternalError();
+    }
+    if ("response" in chunk) {
+      return chunk.response;
+    }
+    location = chunk.location;
+  }
+
   const [res, err] = await wrap<FinishedUploadObject | RegistryError, Error>(
-    env.REGISTRY_CLIENT.finishUpload(
-      name,
-      uuid,
-      url.pathname + "?" + url.searchParams.toString(),
-      digest! as string,
-      req.body ?? undefined,
-      +(req.headers.get("Content-Length") ?? "0"),
-    ),
+    env.REGISTRY_CLIENT.finishUpload(name, uuid, location, digest! as string),
   );
 
   if (err) {
@@ -590,9 +699,12 @@ v2Router.put("/:name+/blobs/uploads/:uuid", async (req, env: Env) => {
 v2Router.head("/:name+/blobs/:tag", async (req, env: Env) => {
   const { name, tag } = req.params;
 
-  const res = await env.REGISTRY.head(`${name}/blobs/${tag}`);
   let layerExistsResponse: CheckLayerResponse | null = null;
-  if (!res) {
+  const localResponse = await env.REGISTRY_CLIENT.layerExists(name, tag);
+  if ("response" in localResponse) {
+    return localResponse.response;
+  }
+  if (!localResponse.exists) {
     const registryList = registries(env);
     for (const registry of registryList) {
       const client = new RegistryHTTPClient(env, registry);
@@ -610,21 +722,15 @@ v2Router.head("/:name+/blobs/:tag", async (req, env: Env) => {
     if (layerExistsResponse === null || !layerExistsResponse.exists)
       return new Response(JSON.stringify(BlobUnknownError), { status: 404 });
   } else {
-    if (res.checksums.sha256 === null) {
-      throw new ServerError("invalid checksum from R2 backend");
-    }
-
-    layerExistsResponse = {
-      digest: hexToDigest(res.checksums.sha256!),
-      size: res.size,
-      exists: true,
-    };
+    layerExistsResponse = localResponse;
   }
 
   return new Response(null, {
     headers: {
       "Content-Length": layerExistsResponse.size.toString(),
       "Docker-Content-Digest": layerExistsResponse.digest,
+      ...identityEncoding,
+      "Accept-Ranges": "bytes",
     },
   });
 });
@@ -686,6 +792,12 @@ v2Router.get("/:name+/tags/list", async (req, env: Env) => {
 
 v2Router.delete("/:name+/blobs/:digest", async (req, env: Env) => {
   const { name, digest } = req.params;
+  if (deletionDisabled(env)) {
+    return new DeletionDisabledError();
+  }
+  if (resolveImmutableTagPattern(env.IMMUTABLE_TAG_PATTERN) !== null) {
+    return new ImmutableBlobError(digest);
+  }
 
   const res = await env.REGISTRY.head(`${name}/blobs/${digest}`);
 
@@ -704,6 +816,9 @@ v2Router.delete("/:name+/blobs/:digest", async (req, env: Env) => {
 
 v2Router.post("/:name+/gc", async (req, env: Env) => {
   const { name } = req.params;
+  if (deletionDisabled(env)) {
+    return new DeletionDisabledError();
+  }
 
   const mode = req.query.mode ?? "unreferenced";
   if (mode !== "unreferenced" && mode !== "untagged") {
