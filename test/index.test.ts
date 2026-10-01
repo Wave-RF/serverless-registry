@@ -3701,3 +3701,46 @@ describe("content-addressed writes", () => {
     expect(tags.tags).toEqual(["v1", "v2"]);
   });
 });
+
+describe("DISABLE_DELETE", () => {
+  async function fetchNoDelete(r: Request, value = "true"): Promise<Response> {
+    r.headers.append("Authorization", usernamePasswordToAuth(username, "world"));
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(r, { ...env, DISABLE_DELETE: value } as Env, ctx);
+    await waitOnExecutionContext(ctx);
+    return res as Response;
+  }
+
+  test("refuses deleting manifests, blobs and garbage collection", async () => {
+    const name = "no-delete/app";
+    const bindings = env as Env;
+    const manifest = await generateManifest(name);
+    const { sha256 } = await createManifest(name, manifest, "v1");
+    const layer = getLayersFromManifest(manifest)[1];
+
+    for (const path of [`/v2/${name}/manifests/v1`, `/v2/${name}/manifests/${sha256}`, `/v2/${name}/blobs/${layer}`]) {
+      const res = await fetchNoDelete(createRequest("DELETE", path, null));
+      expect(res.status).toEqual(405);
+      expect(((await res.json()) as { errors: { code: string }[] }).errors[0].code).toEqual("UNSUPPORTED");
+    }
+    for (const mode of ["unreferenced", "untagged"]) {
+      const res = await fetchNoDelete(createRequest("POST", `/v2/${name}/gc?mode=${mode}`, null));
+      expect(res.status).toEqual(405);
+    }
+
+    expect(await bindings.REGISTRY.head(`${name}/manifests/v1`)).not.toBeNull();
+    expect(await bindings.REGISTRY.head(`${name}/manifests/${sha256}`)).not.toBeNull();
+    expect(await bindings.REGISTRY.head(`${name}/blobs/${layer}`)).not.toBeNull();
+  });
+
+  test("leaves deletion enabled for any other value", async () => {
+    const name = "no-delete/off";
+    const { sha256 } = await createManifest(name, await generateManifest(name), "v1");
+    expect((await fetchNoDelete(createRequest("DELETE", `/v2/${name}/manifests/v1`, null), "false")).status).toEqual(
+      202,
+    );
+    expect((await fetchNoDelete(createRequest("DELETE", `/v2/${name}/manifests/${sha256}`, null), "")).status).toEqual(
+      202,
+    );
+  });
+});

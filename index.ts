@@ -26,6 +26,8 @@ export interface Env {
   REGISTRIES_JSON?: string; // should be in the format of RegistryConfiguration[];
   // Tags matching this regular expression (the whole tag) are create-only, see src/registry/tag-policy.ts
   IMMUTABLE_TAG_PATTERN?: string;
+  // Set to "true" to refuse every delete: manifests, blobs and garbage collection
+  DISABLE_DELETE?: string;
   // Repositories that can be pulled without credentials, see src/anonymous.ts
   ANONYMOUS_PULL_REPOSITORIES?: string;
   // Per request, set by fetch() below

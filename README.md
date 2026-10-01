@@ -119,6 +119,13 @@ manifest writes before any manifest object is stored.
 The policy is enforced at the Worker API boundary. To preserve the invariant, restrict direct R2 write access and
 route registry writes through this Worker.
 
+### Disabling deletion
+
+Set `DISABLE_DELETE = "true"` to make the registry append-only. Deleting manifests (by tag or by digest), deleting
+blobs and garbage collection (`POST /v2/<name>/gc`) then answer `405 Method Not Allowed` with the OCI `UNSUPPORTED`
+error code. Pushing, and moving a tag that is not protected by `IMMUTABLE_TAG_PATTERN`, keep working. Cancelling an
+upload in progress is not affected, because it only removes temporary upload state.
+
 ### Configuring Pull fallback
 
 You can configure the R2 registry to fallback to another registry if

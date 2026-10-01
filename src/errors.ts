@@ -139,6 +139,24 @@ export class ImmutableBlobError extends Response {
   }
 }
 
+// Returned for every delete when DISABLE_DELETE is set. The OCI distribution spec allows a registry
+// to disable deletion and answer 405 Method Not Allowed.
+export class DeletionDisabledError extends Response {
+  constructor() {
+    super(
+      JSON.stringify({
+        errors: [{ code: "UNSUPPORTED", message: "deleting is disabled on this registry", detail: null }],
+      }),
+      {
+        status: 405,
+        headers: {
+          "content-type": "application/json;charset=UTF-8",
+        },
+      },
+    );
+  }
+}
+
 export class ServerError extends Response {
   constructor(message: string, errorCode = 500) {
     super(JSON.stringify({ errors: [{ code: "SERVER_ERROR", message, detail: null }] }), {

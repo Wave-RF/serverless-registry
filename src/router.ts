@@ -1,6 +1,6 @@
 import { Router } from "itty-router";
 import { BlobUnknownError, ManifestUnknownError } from "./v2-errors";
-import { ImmutableBlobError, ImmutableTagError, InternalError, ServerError } from "./errors";
+import { DeletionDisabledError, ImmutableBlobError, ImmutableTagError, InternalError, ServerError } from "./errors";
 import { errorString, getStreamSize, jsonHeaders, wrap } from "./utils";
 import { hexToDigest, isValidDigest } from "./user";
 import { ManifestTagsListTooBigError } from "./v2-responses";
@@ -35,6 +35,12 @@ function formatNextLink(url: URL): string {
 const identityEncoding = { "Content-Encoding": "identity" } as const;
 
 const v2Router = Router({ base: "/v2/" });
+
+// DISABLE_DELETE turns the registry into an append-only store: manifests, blobs and garbage
+// collection can't delete anything. Overwriting a mutable tag is still allowed.
+export function deletionDisabled(env: Env): boolean {
+  return ["true", "1", "yes"].includes((env.DISABLE_DELETE ?? "").trim().toLowerCase());
+}
 
 v2Router.get("/", async (_req, _env: Env) => {
   return new Response();
@@ -79,6 +85,10 @@ v2Router.delete("/:name+/manifests/:reference", async (req, env: Env) => {
   // provided cursor.
   //
   // If somehow we need to remove by paginating, we accept a last query param.
+
+  if (deletionDisabled(env)) {
+    return new DeletionDisabledError();
+  }
 
   const { last, limit } = req.query;
   const { name, reference } = req.params;
@@ -782,6 +792,9 @@ v2Router.get("/:name+/tags/list", async (req, env: Env) => {
 
 v2Router.delete("/:name+/blobs/:digest", async (req, env: Env) => {
   const { name, digest } = req.params;
+  if (deletionDisabled(env)) {
+    return new DeletionDisabledError();
+  }
   if (resolveImmutableTagPattern(env.IMMUTABLE_TAG_PATTERN) !== null) {
     return new ImmutableBlobError(digest);
   }
@@ -803,6 +816,9 @@ v2Router.delete("/:name+/blobs/:digest", async (req, env: Env) => {
 
 v2Router.post("/:name+/gc", async (req, env: Env) => {
   const { name } = req.params;
+  if (deletionDisabled(env)) {
+    return new DeletionDisabledError();
+  }
 
   const mode = req.query.mode ?? "unreferenced";
   if (mode !== "unreferenced" && mode !== "untagged") {
