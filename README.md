@@ -99,6 +99,15 @@ docker rmi ubuntu:latest $REGISTRY_URL/ubuntu:latest
 docker pull $REGISTRY_URL/ubuntu:latest
 ```
 
+### Allowing anonymous pulls
+
+Set `ANONYMOUS_PULL_REPOSITORIES` to a comma or space separated list of repository names that can be pulled without
+credentials. `*` matches any characters, including `/`, so `public/*` allows every repository under `public/` and `*`
+allows all of them. Requests without an `Authorization` header can then read the manifests, blobs, tags and referrers
+of those repositories. Everything else still needs credentials: pushes, deletes, uploads, `/v2/_catalog` and garbage
+collection. `/v2/` keeps answering `401` so that clients still log in before they push, requests with wrong
+credentials are still refused, and anonymous requests never use the pull fallback below.
+
 ### Protecting immutable release tags
 
 Set `IMMUTABLE_TAG_PATTERN` under `[env.production.vars]` to a JavaScript regular expression that must match the
@@ -125,6 +134,16 @@ Set `DISABLE_DELETE = "true"` to make the registry append-only. Deleting manifes
 blobs and garbage collection (`POST /v2/<name>/gc`) then answer `405 Method Not Allowed` with the OCI `UNSUPPORTED`
 error code. Pushing, and moving a tag that is not protected by `IMMUTABLE_TAG_PATTERN`, keep working. Cancelling an
 upload in progress is not affected, because it only removes temporary upload state.
+
+### Using buckets with retention rules
+
+Blobs, manifests stored under their digest and referrer entries are written once and never overwritten: a push of
+content that already exists leaves the stored object alone. The registry therefore works on an R2 bucket whose
+content keys are protected by [bucket locks](https://developers.cloudflare.com/r2/buckets/bucket-locks/) or other
+retention rules. Those keys are `<repository>/blobs/<digest>`, `<repository>/manifests/sha256:<hex>` and
+`<repository>/_referrers/<subject digest>/<referrer digest>`. Tags (`<repository>/manifests/<tag>`) and upload state
+are rewritten and deleted, so keep them outside such rules, and set `DISABLE_DELETE` so that deletes fail cleanly
+instead of hitting the lock.
 
 ### Configuring Pull fallback
 
