@@ -657,7 +657,11 @@ export class R2Registry implements Registry {
         await referrerPut;
       }
     } else {
-      const putTasks: Promise<unknown>[] = [digestPut()];
+      // The digest object must be stored before anything that names it (the tag, the referrer link):
+      // if its write fails, a link or tag written alongside would point at a manifest that does not
+      // exist, and a client following the link would wait for it indefinitely.
+      await digestPut();
+      const putTasks: Promise<unknown>[] = [];
       if (reference !== digestStr) {
         putTasks.push(env.REGISTRY.put(`${name}/manifests/${reference}`, text, putOptions));
       }
